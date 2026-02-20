@@ -1,5 +1,8 @@
 import os
 import sys
+import time
+import select
+import threading
 import shlex
 import subprocess
 from collections import deque
@@ -129,78 +132,98 @@ class TailWorker(QtCore.QObject):
         self._prefill_seconds = max(0, int(prefill_seconds))
         self._proc: Optional[subprocess.Popen] = None
         self._stop_requested = False
+        self._current_path: Optional[str] = None
+        self._switch_requested = False
+        self._poll_thread: Optional[threading.Thread] = None
+        self._poll_stop = threading.Event()
 
     @QtCore.Slot()
     def run(self) -> None:
-        try:
-            remote_path = get_latest_remote_file(self._host, self._remote_dir)
-        except Exception as exc:
-            self.status.emit(f"Error finding remote file: {exc}")
-            self.stopped.emit()
-            return
-
-        if not remote_path:
-            self.status.emit("No remote CSV found. Start ice_plant.py and try again.")
-            self.stopped.emit()
-            return
-
-        self.file_selected.emit(remote_path)
-        self.status.emit(f"Tailing {remote_path}")
-        if self._prefill_seconds > 0:
+        self._start_poll_thread()
+        while not self._stop_requested:
             try:
-                last_line_proc = subprocess.run(
-                    ssh_cmd(self._host, f"tail -n 1 {shlex.quote(remote_path)}"),
-                    capture_output=True,
-                    text=True,
-                )
-                last_line = last_line_proc.stdout.strip()
-                last_parsed = parse_payload_line(last_line) if last_line else None
-                if last_parsed is not None:
-                    latest_ts, _ = last_parsed
-                    cutoff = latest_ts - float(self._prefill_seconds)
-                    awk_cmd = (
-                        f"awk -F, 'NR>1 && $1+0>={cutoff:.6f} {{print}}' "
-                        f"{shlex.quote(remote_path)}"
-                    )
-                    prefill_proc = subprocess.run(
-                        ssh_cmd(self._host, awk_cmd),
-                        capture_output=True,
-                        text=True,
-                    )
-                    for line in prefill_proc.stdout.splitlines():
-                        if self._stop_requested:
-                            break
-                        self.line_received.emit(line)
+                remote_path = get_latest_remote_file(self._host, self._remote_dir)
             except Exception as exc:
-                self.status.emit(f"Prefill failed: {exc}")
-            finally:
-                self.prefill_done.emit()
-        else:
-            self.prefill_done.emit()
+                self.status.emit(f"Error finding remote file: {exc}")
+                self.stopped.emit()
+                return
 
-        cmd = f"tail -F -n 0 {shlex.quote(remote_path)}"
-        try:
-            self._proc = subprocess.Popen(ssh_cmd(self._host, cmd), stdout=subprocess.PIPE, text=True)
-        except Exception as exc:
-            self.status.emit(f"SSH failed: {exc}")
-            self.stopped.emit()
-            return
+            if not remote_path:
+                self.status.emit("No remote CSV found. Start ice_plant.py and try again.")
+                self.stopped.emit()
+                return
 
-        if self._proc.stdout is None:
-            self.status.emit("Failed to open SSH stream.")
-            self.stopped.emit()
-            return
+            if remote_path != self._current_path:
+                self._current_path = remote_path
+                self.file_selected.emit(remote_path)
+                self.status.emit(f"Tailing {remote_path}")
+                if self._prefill_seconds > 0:
+                    try:
+                        last_line_proc = subprocess.run(
+                            ssh_cmd(self._host, f"tail -n 1 {shlex.quote(remote_path)}"),
+                            capture_output=True,
+                            text=True,
+                        )
+                        last_line = last_line_proc.stdout.strip()
+                        last_parsed = parse_payload_line(last_line) if last_line else None
+                        if last_parsed is not None:
+                            latest_ts, _ = last_parsed
+                            cutoff = latest_ts - float(self._prefill_seconds)
+                            awk_cmd = (
+                                f"awk -F, 'NR>1 && $1+0>={cutoff:.6f} {{print}}' "
+                                f"{shlex.quote(remote_path)}"
+                            )
+                            prefill_proc = subprocess.run(
+                                ssh_cmd(self._host, awk_cmd),
+                                capture_output=True,
+                                text=True,
+                            )
+                            for line in prefill_proc.stdout.splitlines():
+                                if self._stop_requested:
+                                    break
+                                self.line_received.emit(line)
+                    except Exception as exc:
+                        self.status.emit(f"Prefill failed: {exc}")
+                    finally:
+                        self.prefill_done.emit()
+                else:
+                    self.prefill_done.emit()
 
-        for line in self._proc.stdout:
-            if self._stop_requested:
+            cmd = f"tail -F -n 0 {shlex.quote(remote_path)}"
+            try:
+                self._proc = subprocess.Popen(ssh_cmd(self._host, cmd), stdout=subprocess.PIPE, text=True)
+            except Exception as exc:
+                self.status.emit(f"SSH failed: {exc}")
+                self.stopped.emit()
                 break
-            self.line_received.emit(line)
 
-        self._cleanup()
+            if self._proc.stdout is None:
+                self.status.emit("Failed to open SSH stream.")
+                self.stopped.emit()
+                break
+
+            while not self._stop_requested:
+                if self._proc.stdout is None:
+                    break
+                rlist, _, _ = select.select([self._proc.stdout], [], [], 1.0)
+                if rlist:
+                    line = self._proc.stdout.readline()
+                    if not line:
+                        break
+                    self.line_received.emit(line)
+                if self._switch_requested:
+                    self._switch_requested = False
+                    self._cleanup()
+                    break
+
+            self._cleanup()
+
+        self._stop_poll_thread()
         self.stopped.emit()
 
     def stop(self) -> None:
         self._stop_requested = True
+        self._stop_poll_thread()
         self._cleanup()
 
     def _cleanup(self) -> None:
@@ -209,6 +232,29 @@ class TailWorker(QtCore.QObject):
                 self._proc.terminate()
             except Exception:
                 pass
+
+    def _start_poll_thread(self) -> None:
+        if self._poll_thread and self._poll_thread.is_alive():
+            return
+        self._poll_stop.clear()
+        self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._poll_thread.start()
+
+    def _stop_poll_thread(self) -> None:
+        if self._poll_thread and self._poll_thread.is_alive():
+            self._poll_stop.set()
+            self._poll_thread.join(timeout=2.0)
+        self._poll_thread = None
+
+    def _poll_loop(self) -> None:
+        while not self._poll_stop.is_set():
+            try:
+                latest = get_latest_remote_file(self._host, self._remote_dir)
+            except Exception:
+                latest = None
+            if latest and latest != self._current_path:
+                self._switch_requested = True
+            self._poll_stop.wait(1.0)
 
 
 class StaticWorker(QtCore.QObject):
@@ -311,6 +357,23 @@ class DownloadWorker(QtCore.QObject):
         self.finished.emit()
 
 
+class FileCheckWorker(QtCore.QObject):
+    result = QtCore.Signal(object)
+
+    def __init__(self, host: str, remote_dir: str, parent: Optional[QtCore.QObject] = None) -> None:
+        super().__init__(parent)
+        self._host = host
+        self._remote_dir = remote_dir
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        try:
+            latest = get_latest_remote_file(self._host, self._remote_dir)
+        except Exception:
+            latest = None
+        self.result.emit(latest)
+
+
 class PlotWidget(QtWidgets.QWidget):
     def __init__(self, title: str, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -349,9 +412,19 @@ class SpectrogramWidget(QtWidgets.QWidget):
 
 
 class MainWindow(QtWidgets.QMainWindow):
+    def __getattr__(self, name: str):
+        if name == "_update_visibility":
+            return lambda *args, **kwargs: None
+        raise AttributeError(name)
+
+    def _update_visibility_wrapper(self, _checked: bool = False) -> None:
+        self._update_visibility()
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("ICE PLANT Viewer")
+        if not hasattr(self, "_update_visibility"):
+            self._update_visibility = lambda: None
 
         self._settings = QtCore.QSettings("ICE_PLANT", "viewer")
         self._default_rc = mpl.rcParams.copy()
@@ -389,15 +462,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._spec_nfft = int(self._spec_window_seconds * SAMPLE_RATE)
         self._spec_hop = max(4, self._spec_nfft // 8)
 
+        # Ensure we never crash if update_visibility gets into a bad state.
+        self._update_visibility = getattr(self, "_update_visibility", lambda: None)
+
         self._hr1_toggle = QtWidgets.QCheckBox("HR1")
         self._hr2_toggle = QtWidgets.QCheckBox("HR2")
         self._mhr_toggle = QtWidgets.QCheckBox("MHR")
         self._hr1_toggle.setChecked(self._settings.value("show_hr1", True, type=bool))
         self._hr2_toggle.setChecked(self._settings.value("show_hr2", True, type=bool))
         self._mhr_toggle.setChecked(self._settings.value("show_mhr", True, type=bool))
-        self._hr1_toggle.toggled.connect(self._update_visibility)
-        self._hr2_toggle.toggled.connect(self._update_visibility)
-        self._mhr_toggle.toggled.connect(self._update_visibility)
+        # Use lambdas so the attribute lookup happens at emit time.
+        self._hr1_toggle.toggled.connect(lambda _checked=False: self._update_visibility_wrapper())
+        self._hr2_toggle.toggled.connect(lambda _checked=False: self._update_visibility_wrapper())
+        self._mhr_toggle.toggled.connect(lambda _checked=False: self._update_visibility_wrapper())
 
         self._tabs = QtWidgets.QTabWidget()
         self._time_plot = PlotWidget("HR (bpm)")
@@ -456,6 +533,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._static_loading = False
         self._static_view = False
         self._suppress_spec_rows = False
+        self._current_remote_file: Optional[str] = None
 
         self._signal_map = {
             "hr1": decode_hr1_samples,
@@ -670,6 +748,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._settings.value("auto_connect", True, type=bool):
             self._connect()
 
+    # File switching is handled inside TailWorker now.
+
     def _on_spec_window_changed(self, text: str) -> None:
         try:
             window_seconds = int(text)
@@ -817,6 +897,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stop_download_worker()
 
     def _on_file_selected(self, path: str) -> None:
+        self._current_remote_file = path
         name = os.path.basename(path).lower()
         is_sim = "_sim" in name or "sim_" in name or name.endswith("sim.csv")
         if is_sim:
