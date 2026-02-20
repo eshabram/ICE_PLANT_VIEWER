@@ -1,3 +1,4 @@
+import os
 import sys
 import shlex
 import subprocess
@@ -113,6 +114,7 @@ class TailWorker(QtCore.QObject):
     status = QtCore.Signal(str)
     stopped = QtCore.Signal()
     prefill_done = QtCore.Signal()
+    file_selected = QtCore.Signal(str)
 
     def __init__(
         self,
@@ -142,6 +144,7 @@ class TailWorker(QtCore.QObject):
             self.stopped.emit()
             return
 
+        self.file_selected.emit(remote_path)
         self.status.emit(f"Tailing {remote_path}")
         if self._prefill_seconds > 0:
             try:
@@ -212,6 +215,7 @@ class StaticWorker(QtCore.QObject):
     data_ready = QtCore.Signal(list)
     status = QtCore.Signal(str)
     stopped = QtCore.Signal()
+    file_selected = QtCore.Signal(str)
 
     def __init__(self, host: str, remote_dir: str, parent: Optional[QtCore.QObject] = None) -> None:
         super().__init__(parent)
@@ -232,6 +236,7 @@ class StaticWorker(QtCore.QObject):
             self.stopped.emit()
             return
 
+        self.file_selected.emit(remote_path)
         self.status.emit(f"Loading {remote_path}")
         try:
             lines = read_remote_file(self._host, remote_path)
@@ -477,6 +482,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._spec_plots["hr1"].ax.set_title("HR1 Spectrogram")
         self._spec_plots["hr2"].ax.set_title("HR2 Spectrogram")
         self._spec_plots["mhr"].ax.set_title("MHR Spectrogram")
+        self._simulated_data = False
 
         for sig in ("hr1", "hr2", "mhr"):
             self._spec_plots[sig].setSizePolicy(
@@ -542,6 +548,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker.line_received.connect(self._on_line)
         self._worker.prefill_done.connect(self._on_prefill_done)
         self._worker.status.connect(self._status_label.setText)
+        self._worker.file_selected.connect(self._on_file_selected)
         self._worker.stopped.connect(self._on_worker_stopped)
         self._thread.start()
 
@@ -597,6 +604,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._static_thread.started.connect(self._static_worker.run)
         self._static_worker.status.connect(self._status_label.setText)
+        self._static_worker.file_selected.connect(self._on_file_selected)
         self._static_worker.data_ready.connect(self._on_static_data)
         self._static_worker.stopped.connect(self._on_static_stopped)
         self._static_thread.start()
@@ -808,6 +816,32 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_download_finished(self) -> None:
         self._stop_download_worker()
 
+    def _on_file_selected(self, path: str) -> None:
+        name = os.path.basename(path).lower()
+        is_sim = "_sim" in name or "sim_" in name or name.endswith("sim.csv")
+        if is_sim:
+            self._status_label.setStyleSheet("color: #ff8c00;")
+        else:
+            self._status_label.setStyleSheet("")
+        if is_sim != self._simulated_data:
+            self._simulated_data = is_sim
+            self._apply_plot_titles()
+
+    def _apply_plot_titles(self) -> None:
+        if self._simulated_data:
+            self._time_plot.ax.set_title("Simulated HR (bpm)")
+            self._spec_plots["hr1"].ax.set_title("Simulated HR1 Spectrogram")
+            self._spec_plots["hr2"].ax.set_title("Simulated HR2 Spectrogram")
+            self._spec_plots["mhr"].ax.set_title("Simulated MHR Spectrogram")
+        else:
+            self._time_plot.ax.set_title("HR (bpm)")
+            self._spec_plots["hr1"].ax.set_title("HR1 Spectrogram")
+            self._spec_plots["hr2"].ax.set_title("HR2 Spectrogram")
+            self._spec_plots["mhr"].ax.set_title("MHR Spectrogram")
+        self._time_plot.canvas.draw_idle()
+        for widget in self._spec_plots.values():
+            widget.canvas.draw_idle()
+
     def _stop_download_worker(self) -> None:
         if self._download_thread:
             self._download_thread.quit()
@@ -1009,12 +1043,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._time_plot.canvas.draw_idle()
         self._refresh_spectrogram()
 
+    def _spec_title(self, sig: str) -> str:
+        base = f"{sig.upper()} Spectrogram"
+        if self._simulated_data:
+            return f"Simulated {base}"
+        return base
+
     def _refresh_spectrogram(self) -> None:
         active = self._active_signals()
         if not active:
             for sig, widget in self._spec_plots.items():
                 widget.ax.clear()
-                self._setup_spec_axis(widget.ax, f"{sig.upper()} Spectrogram")
+                self._setup_spec_axis(widget.ax, self._spec_title(sig))
                 widget.ax.text(
                     0.5, 0.5, "Enable a signal", ha="center", va="center",
                     color=self._resolved_text_color(),
@@ -1026,7 +1066,7 @@ class MainWindow(QtWidgets.QMainWindow):
             widget = self._spec_plots[sig]
             if len(self._values[sig]) == 0 or self._spec_filled.get(sig, 0) == 0:
                 widget.ax.clear()
-                self._setup_spec_axis(widget.ax, f"{sig.upper()} Spectrogram")
+                self._setup_spec_axis(widget.ax, self._spec_title(sig))
                 widget.ax.text(
                     0.5, 0.5, "Waiting for samples...", ha="center", va="center",
                     color=self._resolved_text_color(),
@@ -1073,7 +1113,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
             extent = [0, freqs[-1], t_min, t_max]
             widget.ax.clear()
-            self._setup_spec_axis(widget.ax, f"{sig.upper()} Spectrogram")
+            self._setup_spec_axis(widget.ax, self._spec_title(sig))
             finite = spec_display[np.isfinite(spec_display)]
             if finite.size == 0:
                 spec_display = np.zeros_like(spec_display)
