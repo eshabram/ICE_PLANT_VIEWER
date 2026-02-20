@@ -18,9 +18,11 @@ from matplotlib.figure import Figure
 DEFAULT_HOST = "pi@raspberrypi"
 DEFAULT_REMOTE_DIR = "/home/pi/ICE_PLANT/data"
 SAMPLE_RATE = 4.0
+PACKET_SAMPLES = 4
 WINDOW_SECONDS = 120
+MAX_SPEC_WINDOW_SECONDS = 300
 REFRESH_SECONDS = 0.5
-DEFAULT_SPEC_NFFT = 64
+DEFAULT_SPEC_WINDOW_SECONDS = 16
 
 
 def decode_hr_sample(hi: int, lo: int) -> Optional[float]:
@@ -79,7 +81,7 @@ def parse_payload_line(line: str) -> Optional[Tuple[float, List[int]]]:
         if len(values) < payload_len:
             return None
         values = values[:payload_len]
-    if not values or values[0] != 0x43:
+    if not values or values[0] not in (0x43, 0x53):
         return None
     return ts, values
 
@@ -89,7 +91,10 @@ def ssh_cmd(host: str, remote_cmd: str) -> List[str]:
 
 
 def get_latest_remote_file(host: str, remote_dir: str) -> Optional[str]:
-    cmd = f"ls -t {shlex.quote(remote_dir)}/ctg_frames_*.csv 2>/dev/null | head -n1"
+    cmd = (
+        f"ls -t {shlex.quote(remote_dir)}/ctg_frames_*.csv "
+        f"{shlex.quote(remote_dir)}/ctg_frames_sim_*.csv 2>/dev/null | head -n1"
+    )
     proc = subprocess.run(ssh_cmd(host, cmd), capture_output=True, text=True)
     path = proc.stdout.strip()
     return path if path else None
@@ -107,11 +112,19 @@ class TailWorker(QtCore.QObject):
     line_received = QtCore.Signal(str)
     status = QtCore.Signal(str)
     stopped = QtCore.Signal()
+    prefill_done = QtCore.Signal()
 
-    def __init__(self, host: str, remote_dir: str, parent: Optional[QtCore.QObject] = None) -> None:
+    def __init__(
+        self,
+        host: str,
+        remote_dir: str,
+        prefill_seconds: int = 0,
+        parent: Optional[QtCore.QObject] = None,
+    ) -> None:
         super().__init__(parent)
         self._host = host
         self._remote_dir = remote_dir
+        self._prefill_seconds = max(0, int(prefill_seconds))
         self._proc: Optional[subprocess.Popen] = None
         self._stop_requested = False
 
@@ -130,6 +143,38 @@ class TailWorker(QtCore.QObject):
             return
 
         self.status.emit(f"Tailing {remote_path}")
+        if self._prefill_seconds > 0:
+            try:
+                last_line_proc = subprocess.run(
+                    ssh_cmd(self._host, f"tail -n 1 {shlex.quote(remote_path)}"),
+                    capture_output=True,
+                    text=True,
+                )
+                last_line = last_line_proc.stdout.strip()
+                last_parsed = parse_payload_line(last_line) if last_line else None
+                if last_parsed is not None:
+                    latest_ts, _ = last_parsed
+                    cutoff = latest_ts - float(self._prefill_seconds)
+                    awk_cmd = (
+                        f"awk -F, 'NR>1 && $1+0>={cutoff:.6f} {{print}}' "
+                        f"{shlex.quote(remote_path)}"
+                    )
+                    prefill_proc = subprocess.run(
+                        ssh_cmd(self._host, awk_cmd),
+                        capture_output=True,
+                        text=True,
+                    )
+                    for line in prefill_proc.stdout.splitlines():
+                        if self._stop_requested:
+                            break
+                        self.line_received.emit(line)
+            except Exception as exc:
+                self.status.emit(f"Prefill failed: {exc}")
+            finally:
+                self.prefill_done.emit()
+        else:
+            self.prefill_done.emit()
+
         cmd = f"tail -F -n 0 {shlex.quote(remote_path)}"
         try:
             self._proc = subprocess.Popen(ssh_cmd(self._host, cmd), stdout=subprocess.PIPE, text=True)
@@ -273,6 +318,7 @@ class PlotWidget(QtWidgets.QWidget):
         self.ax.xaxis_date()
         self.ax.xaxis.set_major_locator(mdates.AutoDateLocator())
         self.ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+        self.ax.grid(True, alpha=0.3)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -322,9 +368,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._build_menu()
 
-        self._spec_nfft = int(self._settings.value("spec_nfft", DEFAULT_SPEC_NFFT))
-        if self._spec_nfft not in (64, 128, 256):
-            self._spec_nfft = DEFAULT_SPEC_NFFT
+        spec_window = self._settings.value("spec_window_seconds", None)
+        if spec_window is None:
+            legacy_nfft = int(self._settings.value("spec_nfft", DEFAULT_SPEC_WINDOW_SECONDS * SAMPLE_RATE))
+            spec_window = int(round(legacy_nfft / SAMPLE_RATE))
+        else:
+            spec_window = int(spec_window)
+        if spec_window not in (16, 32, 60, 180, 300):
+            spec_window = DEFAULT_SPEC_WINDOW_SECONDS
+        self._spec_window_seconds = spec_window
+
+        self._spec_freq_range = self._settings.value("spec_freq_range", "0-2.0")
+        if self._spec_freq_range not in ("0-0.5", "0-1.0", "0-2.0"):
+            self._spec_freq_range = "0-2.0"
+        self._spec_nfft = int(self._spec_window_seconds * SAMPLE_RATE)
         self._spec_hop = max(4, self._spec_nfft // 8)
 
         self._hr1_toggle = QtWidgets.QCheckBox("HR1")
@@ -360,12 +417,20 @@ class MainWindow(QtWidgets.QMainWindow):
         toggles.addWidget(self._hr2_toggle)
         toggles.addWidget(self._mhr_toggle)
         self._spec_nfft_combo = QtWidgets.QComboBox()
-        self._spec_nfft_combo.addItems(["64", "128", "256"])
-        self._spec_nfft_combo.setCurrentText(str(self._spec_nfft))
-        self._spec_nfft_combo.currentTextChanged.connect(self._on_spec_nfft_changed)
+        self._spec_nfft_combo.addItems(["16", "32", "60", "180", "300"])
+        self._spec_nfft_combo.setCurrentText(str(self._spec_window_seconds))
+        self._spec_nfft_combo.currentTextChanged.connect(self._on_spec_window_changed)
+
+        self._spec_freq_combo = QtWidgets.QComboBox()
+        self._spec_freq_combo.addItems(["0-0.5", "0-1.0", "0-2.0"])
+        self._spec_freq_combo.setCurrentText(self._spec_freq_range)
+        self._spec_freq_combo.currentTextChanged.connect(self._on_spec_freq_changed)
         toggles.addSpacing(12)
-        toggles.addWidget(QtWidgets.QLabel("Spec NFFT:"))
+        toggles.addWidget(QtWidgets.QLabel("Spec Window (s):"))
         toggles.addWidget(self._spec_nfft_combo)
+        toggles.addSpacing(12)
+        toggles.addWidget(QtWidgets.QLabel("Freq Range (Hz):"))
+        toggles.addWidget(self._spec_freq_combo)
         toggles.addStretch(1)
 
         container = QtWidgets.QWidget()
@@ -385,6 +450,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._connected = False
         self._static_loading = False
         self._static_view = False
+        self._suppress_spec_rows = False
 
         self._signal_map = {
             "hr1": decode_hr1_samples,
@@ -418,28 +484,14 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             self._spec_layout.addWidget(self._spec_plots[sig], 0, 0)
 
-        self._spec_buffers: Dict[str, Deque[float]] = {
-            "hr1": deque(),
-            "hr2": deque(),
-            "mhr": deque(),
-        }
-        self._spec_time_buffers: Dict[str, Deque[float]] = {
-            "hr1": deque(),
-            "hr2": deque(),
-            "mhr": deque(),
-        }
         self._spec_bins = self._spec_nfft // 2 + 1
         self._spec_norm = mcolors.Normalize(vmin=0.0, vmax=1.0)
+        self._spec_low_color = "#0b1d3a"
         self._spec_cmap = mcolors.LinearSegmentedColormap.from_list(
             "blue_green",
-            ["#0b1d3a", "#0b3d91", "#00ff6a"],
+            [self._spec_low_color, "#0b3d91", "#00ff6a"],
         )
-        self._spec_cols = 0
-        self._spec_data = {}
-        self._spec_times = {}
-        self._spec_col_index = {}
-        self._spec_filled = {}
-        self._configure_spectrogram_storage(self._window_spec_cols())
+        self._spec_cmap.set_bad(self._spec_low_color)
 
         self._lines = {
             "hr1": self._time_plot.ax.plot([], [], lw=1, color="tab:blue", label="HR1")[0],
@@ -453,8 +505,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._timer.timeout.connect(self._refresh_plots)
         self._timer.start()
 
+        self._configure_spectrogram_storage(self._window_spec_cols())
         self._set_theme_mode(self._theme_mode)
         self._update_visibility()
+        QtCore.QTimer.singleShot(0, self._auto_connect_if_enabled)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[name-defined]
         self._disconnect()
@@ -473,16 +527,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._settings.setValue("recent_host", host)
         self._status_label.setText("Connecting...")
         self._connect_button.setEnabled(False)
+        self._connect_button.setText("Connecting...")
         self._load_button.setEnabled(False)
+        if self._static_view:
+            self._reset_live_buffers()
         self._static_view = False
-        self._configure_spectrogram_storage(self._window_spec_cols())
 
-        self._worker = TailWorker(host, DEFAULT_REMOTE_DIR)
+        prefill_seconds = max(MAX_SPEC_WINDOW_SECONDS, WINDOW_SECONDS)
+        self._worker = TailWorker(host, DEFAULT_REMOTE_DIR, prefill_seconds=prefill_seconds)
         self._thread = QtCore.QThread()
         self._worker.moveToThread(self._thread)
 
         self._thread.started.connect(self._worker.run)
         self._worker.line_received.connect(self._on_line)
+        self._worker.prefill_done.connect(self._on_prefill_done)
         self._worker.status.connect(self._status_label.setText)
         self._worker.stopped.connect(self._on_worker_stopped)
         self._thread.start()
@@ -491,6 +549,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._connect_button.setText("Disconnect")
         self._connect_button.setEnabled(True)
         self._load_button.setEnabled(True)
+        self._suppress_spec_rows = True
 
     def _disconnect(self) -> None:
         if self._worker:
@@ -514,6 +573,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._connected = False
         self._connect_button.setText("Connect")
         self._load_button.setEnabled(True)
+        self._suppress_spec_rows = False
+
+    def _on_prefill_done(self) -> None:
+        self._suppress_spec_rows = False
 
     def _load_latest(self) -> None:
         if self._connected:
@@ -549,12 +612,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stop_static_worker()
         self._load_button.setEnabled(True)
         self._connect_button.setEnabled(True)
+        if self._static_view:
+            self._connect_button.setText("Go Live")
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("File")
         download_action = QtGui.QAction("Download All Remote CSVs...", self)
         download_action.triggered.connect(self._download_all_files)
         file_menu.addAction(download_action)
+
+        file_menu.addSeparator()
+        self._autoconnect_action = QtGui.QAction("Auto-connect on Launch", self)
+        self._autoconnect_action.setCheckable(True)
+        self._autoconnect_action.setChecked(self._settings.value("auto_connect", True, type=bool))
+        self._autoconnect_action.toggled.connect(self._on_autoconnect_toggled)
+        file_menu.addAction(self._autoconnect_action)
 
         view_menu = self.menuBar().addMenu("View")
         theme_menu = view_menu.addMenu("Theme")
@@ -581,22 +653,39 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._set_theme_mode("dark")
 
-    def _on_spec_nfft_changed(self, text: str) -> None:
+    def _on_autoconnect_toggled(self, checked: bool) -> None:
+        self._settings.setValue("auto_connect", checked)
+
+    def _auto_connect_if_enabled(self) -> None:
+        if self._connected or self._static_view:
+            return
+        if self._settings.value("auto_connect", True, type=bool):
+            self._connect()
+
+    def _on_spec_window_changed(self, text: str) -> None:
         try:
-            nfft = int(text)
+            window_seconds = int(text)
         except ValueError:
             return
-        if nfft not in (64, 128, 256):
+        if window_seconds not in (16, 32, 60, 180, 300):
             return
-        if nfft == self._spec_nfft:
+        if window_seconds == self._spec_window_seconds:
             return
-        self._spec_nfft = nfft
+        self._spec_window_seconds = window_seconds
+        self._spec_nfft = int(self._spec_window_seconds * SAMPLE_RATE)
         self._spec_hop = max(4, self._spec_nfft // 8)
         self._spec_bins = self._spec_nfft // 2 + 1
-        self._settings.setValue("spec_nfft", self._spec_nfft)
+        self._settings.setValue("spec_window_seconds", self._spec_window_seconds)
         self._configure_spectrogram_storage(self._window_spec_cols())
-        for sig in self._signal_map:
-            self._rebuild_spectrogram(sig)
+        self._refresh_spectrogram()
+
+    def _on_spec_freq_changed(self, text: str) -> None:
+        if text not in ("0-0.5", "0-1.0", "0-2.0"):
+            return
+        if text == self._spec_freq_range:
+            return
+        self._spec_freq_range = text
+        self._settings.setValue("spec_freq_range", self._spec_freq_range)
         self._refresh_spectrogram()
 
     def _set_theme_mode(self, mode: str) -> None:
@@ -734,12 +823,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._static_loading = False
         total_samples = max((len(self._values[s]) for s in self._signal_map), default=0)
         if total_samples > 0:
-            cols = max(1, (total_samples - self._spec_nfft) // self._spec_hop + 1)
+            cols = max(1, int(np.ceil(total_samples / PACKET_SAMPLES)))
             self._configure_spectrogram_storage(max(cols, 10))
-        for sig in self._signal_map:
-            self._rebuild_spectrogram(sig)
+            self._rebuild_spectrogram_all()
         self._refresh_plots()
         self._status_label.setText("Loaded latest file")
+        self._connect_button.setEnabled(True)
+        self._connect_button.setText("Go Live")
 
     def _on_line(self, line: str) -> None:
         parsed = parse_payload_line(line)
@@ -750,23 +840,25 @@ class MainWindow(QtWidgets.QMainWindow):
             samples = decoder(payload)
             if not samples:
                 continue
+            sample_times: List[float] = []
             for i, bpm in enumerate(samples):
                 t = ts - (3 - i) * 0.25
                 self._times[sig].append(t)
+                sample_times.append(t)
                 if bpm is None:
                     bpm = 0.0
                 self._values[sig].append(bpm)
-                self._spec_buffers[sig].append(bpm)
-                self._spec_time_buffers[sig].append(t)
-            self._process_spectrogram(sig)
+            if not self._static_loading and not self._suppress_spec_rows:
+                self._process_spectrogram(sig, samples, sample_times)
 
         latest_time = max((times[-1] for times in self._times.values() if times), default=None)
         if latest_time is None:
             return
         if self._static_loading:
             return
+        history_seconds = max(WINDOW_SECONDS, MAX_SPEC_WINDOW_SECONDS)
         for sig in self._signal_map:
-            while self._times[sig] and (latest_time - self._times[sig][0]) > WINDOW_SECONDS:
+            while self._times[sig] and (latest_time - self._times[sig][0]) > history_seconds:
                 self._times[sig].popleft()
                 self._values[sig].popleft()
 
@@ -774,82 +866,82 @@ class MainWindow(QtWidgets.QMainWindow):
         for sig in self._signal_map:
             self._times[sig].clear()
             self._values[sig].clear()
-            self._spec_buffers[sig].clear()
-            self._spec_time_buffers[sig].clear()
-            if sig in self._spec_data:
-                self._spec_data[sig].fill(0.0)
-            if sig in self._spec_times:
-                self._spec_times[sig].fill(0.0)
-            if sig in self._spec_col_index:
-                self._spec_col_index[sig] = 0
-            if sig in self._spec_filled:
-                self._spec_filled[sig] = 0
+            # Spectrogram data is stored in a ring buffer.
 
-    def _process_spectrogram(self, sig: str) -> None:
-        buffer = self._spec_buffers[sig]
-        time_buffer = self._spec_time_buffers[sig]
-        if sig not in self._spec_data or self._spec_cols == 0:
+    def _reset_live_buffers(self) -> None:
+        self._clear_buffers()
+        for sig, line in self._lines.items():
+            line.set_data([], [])
+        self._configure_spectrogram_storage(self._window_spec_cols())
+        self._time_plot.canvas.draw_idle()
+        self._refresh_spectrogram()
+
+    def _process_spectrogram(self, sig: str, samples: List[float], times: List[float]) -> None:
+        if not samples or not times:
             return
-        if len(buffer) < self._spec_nfft:
+        nfft = self._spec_nfft
+        values = list(self._values[sig])
+        if len(values) < nfft:
             return
-        while len(buffer) >= self._spec_nfft:
-            window = np.array([buffer[i] for i in range(self._spec_nfft)], dtype=float)
-            window = window - np.mean(window)
-            fft_vals = np.fft.rfft(window * np.hanning(self._spec_nfft))
-            magnitude = np.abs(fft_vals) + 1e-6
-            column = magnitude
-            column_time = time_buffer[self._spec_nfft - 1] if len(time_buffer) >= self._spec_nfft else 0.0
-
-            col_index = self._spec_col_index[sig]
-            self._spec_data[sig][:, col_index] = column
-            self._spec_times[sig][col_index] = column_time
-            self._spec_col_index[sig] = (col_index + 1) % self._spec_cols
-            self._spec_filled[sig] = min(self._spec_filled[sig] + 1, self._spec_cols)
-
-            for _ in range(self._spec_hop):
-                if buffer:
-                    buffer.popleft()
-                if time_buffer:
-                    time_buffer.popleft()
+        seg = np.asarray(values[-nfft:], dtype=float)
+        window = np.hanning(nfft)
+        seg = seg - np.mean(seg)
+        fft_vals = np.fft.rfft(seg * window)
+        power = np.abs(fft_vals) ** 2
+        self._append_spec_column(sig, power, times[-1])
 
     def _rebuild_spectrogram(self, sig: str) -> None:
-        if sig not in self._spec_data or self._spec_cols == 0:
-            return
-        series = np.array(self._values[sig], dtype=float)
-        times = np.array(self._times[sig], dtype=float)
-        if len(series) == 0:
-            return
-        self._spec_data[sig].fill(0.0)
-        self._spec_times[sig].fill(0.0)
         self._spec_col_index[sig] = 0
         self._spec_filled[sig] = 0
+        self._spec_next_index[sig] = 0
+        self._spec_data[sig][:] = np.nan
+        self._spec_times[sig][:] = 0.0
 
-        if len(series) < self._spec_nfft:
-            padded = np.zeros(self._spec_nfft, dtype=float)
-            padded[: len(series)] = series
-            series = padded
-            if len(times) > 0:
-                padded_t = np.full(self._spec_nfft, times[-1], dtype=float)
-                padded_t[: len(times)] = times
-                times = padded_t
-            else:
-                times = np.zeros(self._spec_nfft, dtype=float)
+        values = list(self._values[sig])
+        times = list(self._times[sig])
+        if not values or not times:
+            return
+        for start in range(0, len(values), PACKET_SAMPLES):
+            chunk = values[start : start + PACKET_SAMPLES]
+            chunk_times = times[start : start + PACKET_SAMPLES]
+            if not chunk or not chunk_times:
+                continue
+            self._process_spectrogram(sig, chunk, chunk_times)
 
-        start = 0
-        while start + self._spec_nfft <= len(series) and start + self._spec_nfft <= len(times):
-            window = series[start : start + self._spec_nfft]
-            window = window - np.mean(window)
-            fft_vals = np.fft.rfft(window * np.hanning(self._spec_nfft))
-            magnitude = np.abs(fft_vals) + 1e-6
-            column = magnitude
-            column_time = times[start + self._spec_nfft - 1] if len(times) else 0.0
+    def _rebuild_spectrogram_all(self) -> None:
+        for sig in self._signal_map:
+            self._rebuild_spectrogram(sig)
 
-            col_index = self._spec_col_index[sig]
-            self._spec_data[sig][:, col_index] = column
-            self._spec_times[sig][col_index] = column_time
-            self._spec_col_index[sig] = (col_index + 1) % self._spec_cols
-            self._spec_filled[sig] = min(self._spec_filled[sig] + 1, self._spec_cols)
-            start += self._spec_hop
+    def _compute_spectrogram(self, series: np.ndarray, times: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        n = len(series)
+        nfft = self._spec_nfft
+        hop = self._spec_hop
+        freqs = np.fft.rfftfreq(nfft, d=1.0 / SAMPLE_RATE)
+        window = np.hanning(nfft)
+
+        if n == 0:
+            return np.array([]), np.array([]), np.array([[]])
+
+        cols = []
+        tcols = []
+
+        if n < nfft:
+            padded = np.zeros(nfft, dtype=float)
+            padded[:n] = series
+            fft_vals = np.fft.rfft(padded * window)
+            cols.append(np.abs(fft_vals) ** 2)
+            tcols.append(times[-1])
+        else:
+            for start in range(0, n - nfft + 1, hop):
+                segment = series[start : start + nfft]
+                fft_vals = np.fft.rfft(segment * window)
+                cols.append(np.abs(fft_vals) ** 2)
+                tcols.append(times[start + nfft - 1])
+
+        if not cols:
+            return np.array([]), np.array([]), np.array([[]])
+        Sxx = np.stack(cols, axis=1)  # freq x time
+        return freqs, np.array(tcols), Sxx
 
     def _active_signals(self) -> List[str]:
         active = []
@@ -868,6 +960,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for sig, widget in self._spec_plots.items():
             widget.setVisible(sig in active)
         self._reflow_spectrogram_layout(active)
+        self._adjust_spec_margins(len(active))
         self._settings.setValue("show_hr1", self._hr1_toggle.isChecked())
         self._settings.setValue("show_hr2", self._hr2_toggle.isChecked())
         self._settings.setValue("show_mhr", self._mhr_toggle.isChecked())
@@ -931,9 +1024,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         for sig in active:
             widget = self._spec_plots[sig]
-            if self._spec_filled[sig] == 0 and len(self._values[sig]) >= self._spec_nfft:
-                self._rebuild_spectrogram(sig)
-            if self._spec_filled[sig] == 0:
+            if len(self._values[sig]) == 0 or self._spec_filled.get(sig, 0) == 0:
                 widget.ax.clear()
                 self._setup_spec_axis(widget.ax, f"{sig.upper()} Spectrogram")
                 widget.ax.text(
@@ -943,46 +1034,64 @@ class MainWindow(QtWidgets.QMainWindow):
                 widget.canvas.draw_idle()
                 continue
 
-            filled = self._spec_filled[sig]
-            data = self._spec_data[sig]
-            times = self._spec_times[sig]
-            if filled < self._spec_cols:
-                spec = data[:, :filled]
-                tvals = times[:filled]
-            else:
-                idx = self._spec_col_index[sig]
-                spec = np.hstack((data[:, idx:], data[:, :idx]))
-                tvals = np.hstack((times[idx:], times[:idx]))
+            data, times = self._ordered_spec_data(sig)
+            if data.size == 0 or times.size == 0:
+                continue
 
-            if len(tvals) == 0 or tvals[-1] == 0.0:
-                if self._times[sig]:
-                    t_min = mdates.date2num(datetime.fromtimestamp(float(self._times[sig][0])))
-                    t_max = mdates.date2num(datetime.fromtimestamp(float(self._times[sig][-1])))
-                else:
-                    continue
+            freqs = np.fft.rfftfreq(self._spec_nfft, d=1.0 / SAMPLE_RATE)
+            spec_power = 10 * np.log10(data + 1e-12)
+            # Normalize each time slice so relative spectral shape is visible.
+            row_max = np.nanmax(spec_power, axis=1, keepdims=True)
+            spec_power = spec_power - row_max
+            newest_first = spec_power[::-1, :]
+
+            if self._spec_freq_range == "0-0.5":
+                f_max = 0.5
+            elif self._spec_freq_range == "0-1.0":
+                f_max = 1.0
             else:
-                t_min = mdates.date2num(datetime.fromtimestamp(float(tvals[0])))
-                t_max = mdates.date2num(datetime.fromtimestamp(float(tvals[-1])))
-            if t_max <= t_min:
-                t_max = t_min + 1 / (24 * 60 * 60)
-            extent = [0, SAMPLE_RATE / 2, t_min, t_max]
+                f_max = 2.0
+            freq_mask = freqs <= f_max
+            freqs = freqs[freq_mask]
+            newest_first = newest_first[:, freq_mask]
+
+            if not self._static_view:
+                rows = self._spec_cols
+                spec_display = np.full((rows, newest_first.shape[1]), np.nan, dtype=float)
+                count = min(rows, newest_first.shape[0])
+                spec_display[:count, :] = newest_first[:count, :]
+                latest = float(times[-1])
+                latest = float(int(round(latest)))
+                t_max = mdates.date2num(datetime.fromtimestamp(latest))
+                t_min = mdates.date2num(datetime.fromtimestamp(latest - WINDOW_SECONDS))
+            else:
+                spec_display = newest_first
+                t_min = mdates.date2num(datetime.fromtimestamp(float(times[0])))
+                t_max = mdates.date2num(datetime.fromtimestamp(float(times[-1])))
+                if t_max <= t_min:
+                    t_max = t_min + 1 / (24 * 60 * 60)
+
+            extent = [0, freqs[-1], t_min, t_max]
             widget.ax.clear()
             self._setup_spec_axis(widget.ax, f"{sig.upper()} Spectrogram")
-            vmax = float(np.percentile(spec, 99)) if spec.size else 1.0
-            min_vmax = 1e-3
-            if vmax < min_vmax:
-                vmax = min_vmax
-                spec_display = np.zeros_like(spec)
-            else:
-                spec_display = spec
-            norm = mcolors.Normalize(vmin=0.0, vmax=vmax)
+            finite = spec_display[np.isfinite(spec_display)]
+            if finite.size == 0:
+                spec_display = np.zeros_like(spec_display)
+                finite = spec_display.ravel()
+            vmax = float(np.percentile(finite, 99))
+            vmin = vmax - 60.0
+            if not np.isfinite(vmax):
+                vmax = 0.0
+                vmin = -60.0
+            norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
             widget.ax.imshow(
-                spec_display.T,
+                np.ma.masked_invalid(spec_display),
                 origin="upper",
                 aspect="auto",
                 cmap=self._spec_cmap,
                 norm=norm,
                 extent=extent,
+                interpolation="nearest",
             )
             widget.canvas.draw_idle()
 
@@ -1011,15 +1120,15 @@ class MainWindow(QtWidgets.QMainWindow):
             parent.update()
 
     def _window_spec_cols(self) -> int:
-        hop_seconds = self._spec_hop / SAMPLE_RATE
-        return max(10, int(WINDOW_SECONDS / hop_seconds))
+        packet_seconds = PACKET_SAMPLES / SAMPLE_RATE
+        return max(10, int(WINDOW_SECONDS / packet_seconds))
 
     def _configure_spectrogram_storage(self, cols: int) -> None:
         self._spec_cols = max(1, int(cols))
         self._spec_data = {
-            "hr1": np.zeros((self._spec_bins, self._spec_cols), dtype=float),
-            "hr2": np.zeros((self._spec_bins, self._spec_cols), dtype=float),
-            "mhr": np.zeros((self._spec_bins, self._spec_cols), dtype=float),
+            "hr1": np.full((self._spec_cols, self._spec_bins), np.nan, dtype=float),
+            "hr2": np.full((self._spec_cols, self._spec_bins), np.nan, dtype=float),
+            "mhr": np.full((self._spec_cols, self._spec_bins), np.nan, dtype=float),
         }
         self._spec_times = {
             "hr1": np.zeros(self._spec_cols, dtype=float),
@@ -1028,6 +1137,31 @@ class MainWindow(QtWidgets.QMainWindow):
         }
         self._spec_col_index = {"hr1": 0, "hr2": 0, "mhr": 0}
         self._spec_filled = {"hr1": 0, "hr2": 0, "mhr": 0}
+        self._spec_next_index = {"hr1": 0, "hr2": 0, "mhr": 0}
+
+    def _append_spec_column(self, sig: str, power: np.ndarray, timestamp: float) -> None:
+        if sig not in self._spec_data:
+            return
+        idx = self._spec_next_index[sig]
+        self._spec_data[sig][idx, :] = power
+        self._spec_times[sig][idx] = timestamp
+        self._spec_next_index[sig] = (idx + 1) % self._spec_cols
+        self._spec_filled[sig] = min(self._spec_filled[sig] + 1, self._spec_cols)
+
+    def _ordered_spec_data(self, sig: str) -> Tuple[np.ndarray, np.ndarray]:
+        filled = self._spec_filled.get(sig, 0)
+        if filled <= 0:
+            return np.array([]), np.array([])
+        data = self._spec_data[sig]
+        times = self._spec_times[sig]
+        if filled < self._spec_cols:
+            ordered_data = data[:filled, :]
+            ordered_times = times[:filled]
+        else:
+            start = self._spec_next_index[sig]
+            ordered_data = np.concatenate((data[start:], data[:start]), axis=0)
+            ordered_times = np.concatenate((times[start:], times[:start]), axis=0)
+        return ordered_data, ordered_times
 
     def _setup_spec_axis(self, ax: mpl.axes.Axes, title: str) -> None:  # type: ignore[name-defined]
         ax.set_title(title)
@@ -1036,6 +1170,18 @@ class MainWindow(QtWidgets.QMainWindow):
         ax.yaxis_date()
         ax.yaxis.set_major_locator(mdates.AutoDateLocator())
         ax.yaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+        ax.tick_params(axis="y", labelsize=8, pad=2)
+        ax.tick_params(axis="x", labelsize=8, pad=2)
+
+    def _adjust_spec_margins(self, active_count: int) -> None:
+        if active_count >= 3:
+            left = 0.24
+        elif active_count == 2:
+            left = 0.19
+        else:
+            left = 0.12
+        for widget in self._spec_plots.values():
+            widget._figure.subplots_adjust(left=left, bottom=0.15, right=0.98, top=0.9)
 
 
 def main() -> None:
