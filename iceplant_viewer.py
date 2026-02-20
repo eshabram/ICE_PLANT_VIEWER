@@ -534,6 +534,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._static_view = False
         self._suppress_spec_rows = False
         self._current_remote_file: Optional[str] = None
+        self._last_packet_ts: Optional[float] = None
 
         self._signal_map = {
             "hr1": decode_hr1_samples,
@@ -951,6 +952,21 @@ class MainWindow(QtWidgets.QMainWindow):
         if parsed is None:
             return
         ts, payload = parsed
+        if (
+            self._last_packet_ts is not None
+            and not self._static_loading
+            and not self._suppress_spec_rows
+        ):
+            gap = ts - self._last_packet_ts
+            if gap >= 1.5:
+                missing = int(gap) - 1
+                max_fill = max(MAX_SPEC_WINDOW_SECONDS, WINDOW_SECONDS)
+                if missing > max_fill:
+                    missing = max_fill
+                for step in range(1, missing + 1):
+                    fill_ts = self._last_packet_ts + step
+                    for sig in self._signal_map:
+                        self._append_spec_blank(sig, fill_ts)
         for sig, decoder in self._signal_map.items():
             samples = decoder(payload)
             if not samples:
@@ -965,6 +981,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._values[sig].append(bpm)
             if not self._static_loading and not self._suppress_spec_rows:
                 self._process_spectrogram(sig, samples, sample_times)
+        self._last_packet_ts = ts
 
         latest_time = max((times[-1] for times in self._times.values() if times), default=None)
         if latest_time is None:
@@ -982,6 +999,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._times[sig].clear()
             self._values[sig].clear()
             # Spectrogram data is stored in a ring buffer.
+        self._last_packet_ts = None
 
     def _reset_live_buffers(self) -> None:
         self._clear_buffers()
@@ -1265,6 +1283,15 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         idx = self._spec_next_index[sig]
         self._spec_data[sig][idx, :] = power
+        self._spec_times[sig][idx] = timestamp
+        self._spec_next_index[sig] = (idx + 1) % self._spec_cols
+        self._spec_filled[sig] = min(self._spec_filled[sig] + 1, self._spec_cols)
+
+    def _append_spec_blank(self, sig: str, timestamp: float) -> None:
+        if sig not in self._spec_data:
+            return
+        idx = self._spec_next_index[sig]
+        self._spec_data[sig][idx, :] = np.nan
         self._spec_times[sig][idx] = timestamp
         self._spec_next_index[sig] = (idx + 1) % self._spec_cols
         self._spec_filled[sig] = min(self._spec_filled[sig] + 1, self._spec_cols)
