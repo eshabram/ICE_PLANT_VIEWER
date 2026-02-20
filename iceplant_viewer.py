@@ -308,7 +308,10 @@ class DownloadWorker(QtCore.QObject):
 
     @QtCore.Slot()
     def run(self) -> None:
-        list_cmd = f"ls -1 {shlex.quote(self._remote_dir)}/ctg_frames_*.csv 2>/dev/null"
+        list_cmd = (
+            f"ls -1 {shlex.quote(self._remote_dir)}/ctg_frames_*.csv 2>/dev/null | "
+            f"grep -v '_sim_'"
+        )
         proc = subprocess.run(ssh_cmd(self._host, list_cmd), capture_output=True, text=True)
         if proc.returncode != 0 or not proc.stdout.strip():
             self.status.emit("No remote CSV files found.")
@@ -316,7 +319,10 @@ class DownloadWorker(QtCore.QObject):
             return
 
         self.status.emit("Downloading remote CSV files...")
-        tar_cmd = f"cd {shlex.quote(self._remote_dir)} && tar -czf - ctg_frames_*.csv"
+        tar_cmd = (
+            f"cd {shlex.quote(self._remote_dir)} && "
+            f"tar -czf - --exclude='*sim*' ctg_frames_*.csv"
+        )
         ssh_proc = subprocess.Popen(
             ssh_cmd(self._host, tar_cmd),
             stdout=subprocess.PIPE,
@@ -1180,7 +1186,10 @@ class MainWindow(QtWidgets.QMainWindow):
             freqs = np.fft.rfftfreq(self._spec_nfft, d=1.0 / SAMPLE_RATE)
             spec_power = 10 * np.log10(data + 1e-12)
             # Normalize each time slice so relative spectral shape is visible.
-            row_max = np.nanmax(spec_power, axis=1, keepdims=True)
+            valid_rows = np.isfinite(spec_power).any(axis=1, keepdims=True)
+            row_max = np.zeros((spec_power.shape[0], 1), dtype=spec_power.dtype)
+            if np.any(valid_rows):
+                row_max[valid_rows[:, 0]] = np.nanmax(spec_power[valid_rows[:, 0]], axis=1, keepdims=True)
             spec_power = spec_power - row_max
             newest_first = spec_power[::-1, :]
 
