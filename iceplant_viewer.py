@@ -958,21 +958,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if parsed is None:
             return
         ts, payload = parsed
-        if (
-            self._last_packet_ts is not None
-            and not self._static_loading
-            and not self._suppress_spec_rows
-        ):
-            gap = ts - self._last_packet_ts
-            if gap >= 1.5:
-                missing = int(gap) - 1
-                max_fill = max(MAX_SPEC_WINDOW_SECONDS, WINDOW_SECONDS)
-                if missing > max_fill:
-                    missing = max_fill
-                for step in range(1, missing + 1):
-                    fill_ts = self._last_packet_ts + step
-                    for sig in self._signal_map:
-                        self._append_spec_blank(sig, fill_ts)
         for sig, decoder in self._signal_map.items():
             samples = decoder(payload)
             if not samples:
@@ -1169,7 +1154,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         for sig in active:
             widget = self._spec_plots[sig]
-            if len(self._values[sig]) == 0 or self._spec_filled.get(sig, 0) == 0:
+            if len(self._values[sig]) < self._spec_nfft or self._spec_filled.get(sig, 0) == 0:
                 widget.ax.clear()
                 self._setup_spec_axis(widget.ax, self._spec_title(sig))
                 widget.ax.text(
