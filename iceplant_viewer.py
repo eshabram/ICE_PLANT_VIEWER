@@ -91,7 +91,17 @@ def parse_payload_line(line: str) -> Optional[Tuple[float, List[int]]]:
 
 
 def ssh_cmd(host: str, remote_cmd: str) -> List[str]:
-    return ["ssh", host, remote_cmd]
+    return [
+        "ssh",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "ServerAliveInterval=2",
+        "-o",
+        "ServerAliveCountMax=2",
+        host,
+        remote_cmd,
+    ]
 
 
 def get_latest_remote_file(host: str, remote_dir: str) -> Optional[str]:
@@ -99,14 +109,14 @@ def get_latest_remote_file(host: str, remote_dir: str) -> Optional[str]:
         f"ls -t {shlex.quote(remote_dir)}/ctg_frames_*.csv "
         f"{shlex.quote(remote_dir)}/ctg_frames_sim_*.csv 2>/dev/null | head -n1"
     )
-    proc = subprocess.run(ssh_cmd(host, cmd), capture_output=True, text=True)
+    proc = subprocess.run(ssh_cmd(host, cmd), capture_output=True, text=True, timeout=5)
     path = proc.stdout.strip()
     return path if path else None
 
 
 def read_remote_file(host: str, path: str) -> List[str]:
     cmd = f"cat {shlex.quote(path)}"
-    proc = subprocess.run(ssh_cmd(host, cmd), capture_output=True, text=True)
+    proc = subprocess.run(ssh_cmd(host, cmd), capture_output=True, text=True, timeout=10)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "Failed to read remote file.")
     return proc.stdout.splitlines()
@@ -144,7 +154,7 @@ class TailWorker(QtCore.QObject):
             try:
                 remote_path = get_latest_remote_file(self._host, self._remote_dir)
             except Exception as exc:
-                self.status.emit(f"Error finding remote file: {exc}")
+                self.status.emit(f"Disconnected: {exc}")
                 self.stopped.emit()
                 return
 
@@ -163,6 +173,7 @@ class TailWorker(QtCore.QObject):
                             ssh_cmd(self._host, f"tail -n 1 {shlex.quote(remote_path)}"),
                             capture_output=True,
                             text=True,
+                            timeout=5,
                         )
                         last_line = last_line_proc.stdout.strip()
                         last_parsed = parse_payload_line(last_line) if last_line else None
@@ -177,6 +188,7 @@ class TailWorker(QtCore.QObject):
                                 ssh_cmd(self._host, awk_cmd),
                                 capture_output=True,
                                 text=True,
+                                timeout=10,
                             )
                             for line in prefill_proc.stdout.splitlines():
                                 if self._stop_requested:
@@ -193,7 +205,7 @@ class TailWorker(QtCore.QObject):
             try:
                 self._proc = subprocess.Popen(ssh_cmd(self._host, cmd), stdout=subprocess.PIPE, text=True)
             except Exception as exc:
-                self.status.emit(f"SSH failed: {exc}")
+                self.status.emit(f"Disconnected: {exc}")
                 self.stopped.emit()
                 break
 
@@ -209,11 +221,17 @@ class TailWorker(QtCore.QObject):
                 if rlist:
                     line = self._proc.stdout.readline()
                     if not line:
+                        self.status.emit("Disconnected")
+                        self._stop_requested = True
                         break
                     self.line_received.emit(line)
                 if self._switch_requested:
                     self._switch_requested = False
                     self._cleanup()
+                    break
+                if self._proc and self._proc.poll() is not None:
+                    self.status.emit("Disconnected")
+                    self._stop_requested = True
                     break
 
             self._cleanup()
@@ -620,6 +638,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._connect_button.setEnabled(False)
         self._connect_button.setText("Connecting...")
         self._load_button.setEnabled(False)
+        self._on_status("Connecting...")
         if self._static_view:
             self._reset_live_buffers()
         self._static_view = False
@@ -632,7 +651,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._thread.started.connect(self._worker.run)
         self._worker.line_received.connect(self._on_line)
         self._worker.prefill_done.connect(self._on_prefill_done)
-        self._worker.status.connect(self._status_label.setText)
+        self._worker.status.connect(self._on_status)
         self._worker.file_selected.connect(self._on_file_selected)
         self._worker.stopped.connect(self._on_worker_stopped)
         self._thread.start()
@@ -653,7 +672,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._thread = None
         self._connected = False
         self._connect_button.setText("Connect")
-        self._status_label.setText("Disconnected")
+        self._on_status("Disconnected")
         self._load_button.setEnabled(True)
 
     def _on_worker_stopped(self) -> None:
@@ -664,6 +683,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._thread = None
         self._connected = False
         self._connect_button.setText("Connect")
+        self._on_status("Disconnected")
         self._load_button.setEnabled(True)
         self._suppress_spec_rows = False
 
@@ -688,7 +708,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._static_worker.moveToThread(self._static_thread)
 
         self._static_thread.started.connect(self._static_worker.run)
-        self._static_worker.status.connect(self._status_label.setText)
+        self._static_worker.status.connect(self._on_status)
         self._static_worker.file_selected.connect(self._on_file_selected)
         self._static_worker.data_ready.connect(self._on_static_data)
         self._static_worker.stopped.connect(self._on_static_stopped)
@@ -892,13 +912,35 @@ class MainWindow(QtWidgets.QMainWindow):
         self._download_worker.moveToThread(self._download_thread)
 
         self._download_thread.started.connect(self._download_worker.run)
-        self._download_worker.status.connect(self._status_label.setText)
+        self._download_worker.status.connect(self._on_status)
         self._download_worker.error.connect(self._show_error)
         self._download_worker.finished.connect(self._on_download_finished)
         self._download_thread.start()
 
     def _show_error(self, message: str) -> None:
         QtWidgets.QMessageBox.critical(self, "Download Error", message)
+
+    def _on_status(self, message: str) -> None:
+        self._status_label.setText(message)
+        lower = message.lower()
+        if lower.startswith("disconnected"):
+            self._status_label.setStyleSheet("color: #d32f2f;")
+            self._connect_button.setText("Connect")
+            self._connect_button.setEnabled(True)
+            self._connected = False
+        elif lower.startswith("connecting"):
+            # Neutral state while connecting.
+            self._status_label.setStyleSheet("")
+        elif lower.startswith("tailing") or lower.startswith("loading"):
+            if self._simulated_data:
+                self._status_label.setStyleSheet("color: #ff8c00;")
+            else:
+                self._status_label.setStyleSheet("")
+        else:
+            if self._simulated_data:
+                self._status_label.setStyleSheet("color: #ff8c00;")
+            else:
+                self._status_label.setStyleSheet("")
 
     def _on_download_finished(self) -> None:
         self._stop_download_worker()
