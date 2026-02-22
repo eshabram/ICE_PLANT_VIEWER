@@ -492,13 +492,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._hr1_toggle = QtWidgets.QCheckBox("HR1")
         self._hr2_toggle = QtWidgets.QCheckBox("HR2")
         self._mhr_toggle = QtWidgets.QCheckBox("MHR")
+        self._spo2_toggle = QtWidgets.QCheckBox("SpO2")
         self._hr1_toggle.setChecked(self._settings.value("show_hr1", True, type=bool))
         self._hr2_toggle.setChecked(self._settings.value("show_hr2", True, type=bool))
         self._mhr_toggle.setChecked(self._settings.value("show_mhr", True, type=bool))
+        self._spo2_toggle.setChecked(self._settings.value("show_spo2", True, type=bool))
         # Use lambdas so the attribute lookup happens at emit time.
         self._hr1_toggle.toggled.connect(lambda _checked=False: self._update_visibility_wrapper())
         self._hr2_toggle.toggled.connect(lambda _checked=False: self._update_visibility_wrapper())
         self._mhr_toggle.toggled.connect(lambda _checked=False: self._update_visibility_wrapper())
+        self._spo2_toggle.toggled.connect(lambda _checked=False: self._update_visibility_wrapper())
 
         self._tabs = QtWidgets.QTabWidget()
         self._time_plot = PlotWidget("HR (bpm)")
@@ -522,6 +525,7 @@ class MainWindow(QtWidgets.QMainWindow):
         toggles.addWidget(self._hr1_toggle)
         toggles.addWidget(self._hr2_toggle)
         toggles.addWidget(self._mhr_toggle)
+        toggles.addWidget(self._spo2_toggle)
         self._spec_nfft_combo = QtWidgets.QComboBox()
         self._spec_nfft_combo.addItems(["16", "32", "60", "180", "300"])
         self._spec_nfft_combo.setCurrentText(str(self._spec_window_seconds))
@@ -570,11 +574,13 @@ class MainWindow(QtWidgets.QMainWindow):
             "hr1": deque(),
             "hr2": deque(),
             "mhr": deque(),
+            "spo2": deque(),
         }
         self._values: Dict[str, Deque[float]] = {
             "hr1": deque(),
             "hr2": deque(),
             "mhr": deque(),
+            "spo2": deque(),
         }
 
         self._spec_plots = {
@@ -607,7 +613,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "hr2": self._time_plot.ax.plot([], [], lw=1, color="tab:orange", label="HR2")[0],
             "mhr": self._time_plot.ax.plot([], [], lw=1, color="tab:green", label="MHR")[0],
         }
-        self._time_plot.ax.legend(loc="upper right")
+        self._spo2_ax = self._time_plot.ax.twinx()
+        self._spo2_ax.set_ylabel("SpO2")
+        self._spo2_line = self._spo2_ax.plot([], [], lw=1, color="tab:red", label="SpO2")[0]
+        self._time_plot.ax.legend(loc="upper left")
+        self._spo2_ax.legend(loc="upper right")
 
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(int(REFRESH_SECONDS * 1000))
@@ -854,6 +864,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "legend.edgecolor": edge_color,
         })
         self._apply_axes_theme(self._time_plot.ax)
+        if hasattr(self, "_spo2_ax"):
+            self._apply_axes_theme(self._spo2_ax)
         for widget in self._spec_plots.values():
             self._apply_axes_theme(widget.ax)
 
@@ -890,6 +902,11 @@ class MainWindow(QtWidgets.QMainWindow):
             leg.get_frame().set_edgecolor(edge)
             for text in leg.get_texts():
                 text.set_color(text_color)
+
+        if hasattr(self, "_spo2_ax") and ax is self._spo2_ax:
+            ax.spines["right"].set_color(mpl.rcParams["axes.edgecolor"])
+            ax.yaxis.label.set_color(mpl.rcParams["axes.labelcolor"])
+            ax.tick_params(colors=mpl.rcParams["ytick.color"])
 
     def _resolved_text_color(self) -> str:
         text_color = mpl.rcParams.get("text.color", "black")
@@ -1000,6 +1017,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if parsed is None:
             return
         ts, payload = parsed
+        if len(payload) > 34:
+            spo2 = payload[34]
+            if spo2 != 0:
+                for i in range(PACKET_SAMPLES):
+                    t = ts - (3 - i) * 0.25
+                    self._times["spo2"].append(t)
+                    self._values["spo2"].append(float(spo2))
         for sig, decoder in self._signal_map.items():
             samples = decoder(payload)
             if not samples:
@@ -1031,7 +1055,9 @@ class MainWindow(QtWidgets.QMainWindow):
         for sig in self._signal_map:
             self._times[sig].clear()
             self._values[sig].clear()
-            # Spectrogram data is stored in a ring buffer.
+        self._times["spo2"].clear()
+        self._values["spo2"].clear()
+        # Spectrogram data is stored in a ring buffer.
         self._last_packet_ts = None
 
     def _reset_live_buffers(self) -> None:
@@ -1123,6 +1149,8 @@ class MainWindow(QtWidgets.QMainWindow):
         active = set(self._active_signals())
         for sig, line in self._lines.items():
             line.set_visible(sig in active)
+        self._spo2_line.set_visible(self._spo2_toggle.isChecked())
+        self._spo2_ax.set_visible(self._spo2_toggle.isChecked())
         for sig, widget in self._spec_plots.items():
             widget.setVisible(sig in active)
         self._reflow_spectrogram_layout(active)
@@ -1130,6 +1158,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._settings.setValue("show_hr1", self._hr1_toggle.isChecked())
         self._settings.setValue("show_hr2", self._hr2_toggle.isChecked())
         self._settings.setValue("show_mhr", self._mhr_toggle.isChecked())
+        self._settings.setValue("show_spo2", self._spo2_toggle.isChecked())
         self._time_plot.canvas.draw_idle()
         self._refresh_spectrogram()
 
@@ -1157,6 +1186,10 @@ class MainWindow(QtWidgets.QMainWindow):
             x = mdates.date2num([datetime.fromtimestamp(t) for t in self._times[sig]])
             y = np.array(self._values[sig])
             self._lines[sig].set_data(x[: len(y)], y)
+        if self._times["spo2"]:
+            x_spo2 = mdates.date2num([datetime.fromtimestamp(t) for t in self._times["spo2"]])
+            y_spo2 = np.array(self._values["spo2"])
+            self._spo2_line.set_data(x_spo2[: len(y_spo2)], y_spo2)
 
         if self._static_view:
             x_min = mdates.date2num(datetime.fromtimestamp(base_time))
@@ -1172,6 +1205,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if len(all_vals):
             self._time_plot.ax.set_ylim(max(0, all_vals.min() - 5), all_vals.max() + 5)
 
+        if self._times["spo2"]:
+            self._spo2_ax.set_xlim(x_min, x_max)
+            self._spo2_ax.set_ylim(80, 100)
         self._time_plot.canvas.draw_idle()
         self._refresh_spectrogram()
 
