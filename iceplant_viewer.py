@@ -900,10 +900,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._host_input = QtWidgets.QLineEdit()
         self._host_input.setPlaceholderText("pi@raspberrypi or 192.168.1.10")
-        if getattr(sys, "frozen", False):
-            self._host_input.setText(DEFAULT_HOST)
-        else:
-            self._host_input.setText(self._settings.value("recent_host", DEFAULT_HOST))
+        self._host_input.setText(self._settings.value("recent_host", DEFAULT_HOST))
 
         self._connect_button = QtWidgets.QPushButton("Connect")
         self._connect_button.clicked.connect(self._toggle_connection)
