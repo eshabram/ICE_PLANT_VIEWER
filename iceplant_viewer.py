@@ -769,6 +769,10 @@ class SerialTerminalDialog(QtWidgets.QDialog):
         super().closeEvent(event)
 
     def _append(self, text: str) -> None:
+        if not text:
+            return
+        # Filter bracketed-paste control sequences for a cleaner display.
+        text = text.replace("\x1b[?2004h", "").replace("\x1b[?2004l", "")
         self._output.moveCursor(QtGui.QTextCursor.End)
         self._output.insertPlainText(text)
         self._output.moveCursor(QtGui.QTextCursor.End)
@@ -790,6 +794,13 @@ class SerialTerminalDialog(QtWidgets.QDialog):
 
     def _disconnect(self) -> None:
         if self._worker:
+            # Attempt to end shell session cleanly so next open starts at login.
+            try:
+                self._worker.send("logout\r\n")
+                # Give the shell a moment to process before tearing down.
+                time.sleep(0.2)
+            except Exception:
+                pass
             self._worker.stop()
         if self._thread:
             self._thread.quit()
@@ -1231,6 +1242,7 @@ class MainWindow(QtWidgets.QMainWindow):
         connection_menu.addAction(serial_connect_action)
         serial_terminal_action = QtGui.QAction("Open Serial Terminal", self)
         serial_terminal_action.triggered.connect(self._open_serial_terminal)
+        self._serial_terminal_action = serial_terminal_action
         connection_menu.addAction(serial_terminal_action)
 
         view_menu = self.menuBar().addMenu("View")
@@ -1273,6 +1285,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if not port:
             QtWidgets.QMessageBox.warning(self, "Serial Connect", "ICEPLANT serial gadget not found.")
             return
+        if any(dialog.isVisible() for dialog in self._serial_dialogs):
+            for dialog in list(self._serial_dialogs):
+                try:
+                    dialog.close()
+                except Exception:
+                    pass
+            QtWidgets.QApplication.processEvents()
         if self._serial_thread and not self._serial_thread.isRunning():
             self._serial_thread = None
             self._serial_worker = None
@@ -1318,9 +1337,18 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._serial_thread:
             # Pause serial data stream and reuse the device for the interactive terminal.
             self._stop_serial_stream("Serial: Disconnected (terminal took over)")
+        if any(dialog.isVisible() for dialog in self._serial_dialogs):
+            return
         dialog = SerialTerminalDialog(port, self)
         self._serial_dialogs.append(dialog)
-        dialog.finished.connect(lambda _=0, d=dialog: self._serial_dialogs.remove(d) if d in self._serial_dialogs else None)
+        if hasattr(self, "_serial_terminal_action"):
+            self._serial_terminal_action.setEnabled(False)
+        def _on_dialog_finished(_: int = 0, d: QtWidgets.QDialog = dialog) -> None:
+            if d in self._serial_dialogs:
+                self._serial_dialogs.remove(d)
+            if hasattr(self, "_serial_terminal_action"):
+                self._serial_terminal_action.setEnabled(True)
+        dialog.finished.connect(_on_dialog_finished)
         dialog.show()
 
     def _start_serial_stream(self, port: str, username: str, password: str) -> None:
