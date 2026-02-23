@@ -1837,12 +1837,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if self._times["spo2"]:
             self._spo2_ax.set_xlim(x_min, x_max)
-            spo2_vals = np.array(self._values["spo2"])
-            if len(spo2_vals):
-                ymin = float(np.nanmin(spo2_vals))
-                ymax = float(np.nanmax(spo2_vals))
-                pad = max(1.0, 0.05 * (ymax - ymin if ymax > ymin else 1.0))
-                self._spo2_ax.set_ylim(ymin - pad, ymax + pad)
+            self._spo2_ax.set_ylim(70, 100)
         self._time_plot.canvas.draw_idle()
         self._refresh_spectrogram()
 
