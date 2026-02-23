@@ -22,3 +22,15 @@ On connect, the app fetches prior data from the current remote file (based on ti
    - `dist/Ice Plant Viewer.app`
 
 The macOS menu bar app name comes from the bundle; the `.app` name here is what will display.
+
+## Build Artifacts (Git)
+Do not commit build outputs:
+- `dist/`
+- `build/`
+
+If already tracked:
+1. `git rm -r --cached dist build`
+2. Add to `.gitignore`
+
+## Packaged App Defaults
+The packaged app does not persist your personal host/IP in the build. It always starts with the default host in the UI.
