@@ -1,5 +1,13 @@
 import os
 import sys
+import glob
+import platform
+from typing import Callable
+
+try:
+    import serial  # type: ignore
+except Exception:
+    serial = None
 import time
 import select
 import threading
@@ -154,19 +162,19 @@ class TailWorker(QtCore.QObject):
             try:
                 remote_path = get_latest_remote_file(self._host, self._remote_dir)
             except Exception as exc:
-                self.status.emit(f"Disconnected: {exc}")
+                self.status.emit(f"Remote: Disconnected: {exc}")
                 self.stopped.emit()
                 return
 
             if not remote_path:
-                self.status.emit("No remote CSV found. Start ice_plant.py and try again.")
+                self.status.emit("Remote: No CSV found. Start ice_plant.py and try again.")
                 self.stopped.emit()
                 return
 
             if remote_path != self._current_path:
                 self._current_path = remote_path
                 self.file_selected.emit(remote_path)
-                self.status.emit(f"Tailing {remote_path}")
+                self.status.emit(f"Remote: Tailing {remote_path}")
                 if self._prefill_seconds > 0:
                     try:
                         last_line_proc = subprocess.run(
@@ -195,7 +203,7 @@ class TailWorker(QtCore.QObject):
                                     break
                                 self.line_received.emit(line)
                     except Exception as exc:
-                        self.status.emit(f"Prefill failed: {exc}")
+                        self.status.emit(f"Remote: Prefill failed: {exc}")
                     finally:
                         self.prefill_done.emit()
                 else:
@@ -205,12 +213,12 @@ class TailWorker(QtCore.QObject):
             try:
                 self._proc = subprocess.Popen(ssh_cmd(self._host, cmd), stdout=subprocess.PIPE, text=True)
             except Exception as exc:
-                self.status.emit(f"Disconnected: {exc}")
+                self.status.emit(f"Remote: Disconnected: {exc}")
                 self.stopped.emit()
                 break
 
             if self._proc.stdout is None:
-                self.status.emit("Failed to open SSH stream.")
+                self.status.emit("Remote: Failed to open SSH stream.")
                 self.stopped.emit()
                 break
 
@@ -221,7 +229,7 @@ class TailWorker(QtCore.QObject):
                 if rlist:
                     line = self._proc.stdout.readline()
                     if not line:
-                        self.status.emit("Disconnected")
+                        self.status.emit("Remote: Disconnected")
                         self._stop_requested = True
                         break
                     self.line_received.emit(line)
@@ -230,7 +238,7 @@ class TailWorker(QtCore.QObject):
                     self._cleanup()
                     break
                 if self._proc and self._proc.poll() is not None:
-                    self.status.emit("Disconnected")
+                    self.status.emit("Remote: Disconnected")
                     self._stop_requested = True
                     break
 
@@ -291,21 +299,21 @@ class StaticWorker(QtCore.QObject):
         try:
             remote_path = get_latest_remote_file(self._host, self._remote_dir)
         except Exception as exc:
-            self.status.emit(f"Error finding remote file: {exc}")
+            self.status.emit(f"Remote: Error finding file: {exc}")
             self.stopped.emit()
             return
 
         if not remote_path:
-            self.status.emit("No remote CSV found. Start ice_plant.py and try again.")
+            self.status.emit("Remote: No CSV found. Start ice_plant.py and try again.")
             self.stopped.emit()
             return
 
         self.file_selected.emit(remote_path)
-        self.status.emit(f"Loading {remote_path}")
+        self.status.emit(f"Remote: Loading {remote_path}")
         try:
             lines = read_remote_file(self._host, remote_path)
         except Exception as exc:
-            self.status.emit(f"Read failed: {exc}")
+            self.status.emit(f"Remote: Read failed: {exc}")
             self.stopped.emit()
             return
 
@@ -332,11 +340,11 @@ class DownloadWorker(QtCore.QObject):
         )
         proc = subprocess.run(ssh_cmd(self._host, list_cmd), capture_output=True, text=True)
         if proc.returncode != 0 or not proc.stdout.strip():
-            self.status.emit("No remote CSV files found.")
+            self.status.emit("Remote: No CSV files found.")
             self.finished.emit()
             return
 
-        self.status.emit("Downloading remote CSV files...")
+        self.status.emit("Remote: Downloading CSV files...")
         tar_cmd = (
             f"cd {shlex.quote(self._remote_dir)} && "
             f"tar -czf - --exclude='*sim*' ctg_frames_*.csv"
@@ -347,7 +355,7 @@ class DownloadWorker(QtCore.QObject):
             stderr=subprocess.PIPE,
         )
         if ssh_proc.stdout is None:
-            self.status.emit("Failed to start SSH download.")
+            self.status.emit("Remote: Failed to start SSH download.")
             self.finished.emit()
             return
 
@@ -365,21 +373,423 @@ class DownloadWorker(QtCore.QObject):
 
         if ssh_proc.returncode != 0:
             msg = ssh_err.strip() or "SSH download failed."
-            self.status.emit("Download failed. See details.")
+            self.status.emit("Remote: Download failed. See details.")
             self.error.emit(msg)
             self.finished.emit()
             return
 
         if tar_proc.returncode != 0:
             msg = (tar_err.decode("utf-8", errors="replace") if tar_err else "").strip()
-            self.status.emit("Download failed. See details.")
+            self.status.emit("Remote: Download failed. See details.")
             self.error.emit(msg or "Failed to extract downloaded files.")
             self.finished.emit()
             return
 
-        self.status.emit(f"Downloaded CSV files to {self._dest_dir}")
+        self.status.emit(f"Remote: Downloaded CSV files to {self._dest_dir}")
         self.finished.emit()
 
+
+class SerialWorker(QtCore.QObject):
+    data = QtCore.Signal(str)
+    status = QtCore.Signal(str)
+    stopped = QtCore.Signal()
+
+    def __init__(self, port: str, baud: int = 115200, parent: Optional[QtCore.QObject] = None) -> None:
+        super().__init__(parent)
+        self._port = port
+        self._baud = baud
+        self._stop = False
+        self._ser = None
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        if serial is None:
+            self.status.emit("pyserial not installed")
+            self.stopped.emit()
+            return
+        try:
+            self._ser = serial.Serial(self._port, self._baud, timeout=0.1, exclusive=True)
+            try:
+                # Toggle DTR/RTS to prompt login banner on connect.
+                self._ser.dtr = False
+                self._ser.rts = False
+                time.sleep(0.2)
+                self._ser.dtr = True
+                self._ser.rts = True
+            except Exception:
+                pass
+            try:
+                self._ser.reset_output_buffer()
+            except Exception:
+                pass
+            # Capture any existing banner first; if none arrives, send a single newline to prompt it.
+            banner = b""
+            start = time.time()
+            while time.time() - start < 1.0:
+                if self._ser.in_waiting:
+                    banner += self._ser.read(self._ser.in_waiting)
+                if banner:
+                    break
+                time.sleep(0.05)
+            if banner:
+                self.data.emit(banner.decode(errors="replace"))
+            else:
+                try:
+                    self._ser.write(b"\r\n")
+                except Exception:
+                    pass
+                start = time.time()
+                while time.time() - start < 0.6:
+                    if self._ser.in_waiting:
+                        banner += self._ser.read(self._ser.in_waiting)
+                    if banner:
+                        break
+                    time.sleep(0.05)
+                if banner:
+                    self.data.emit(banner.decode(errors="replace"))
+            self.status.emit(f"Connected: {self._port}")
+        except Exception as exc:
+            self.status.emit(f"Connect failed: {exc}")
+            self.stopped.emit()
+            return
+
+        try:
+            while not self._stop:
+                try:
+                    if self._ser.in_waiting:
+                        data = self._ser.read(self._ser.in_waiting)
+                        if data:
+                            self.data.emit(data.decode(errors="replace"))
+                except Exception as exc:
+                    self.status.emit(f"Serial: Disconnected: {exc}")
+                    break
+        finally:
+            try:
+                if self._ser:
+                    self._ser.close()
+            except Exception:
+                pass
+            self._ser = None
+            self.stopped.emit()
+
+    @QtCore.Slot(str)
+    def send(self, text: str) -> None:
+        if not self._ser:
+            return
+        try:
+            self._ser.write(text.encode())
+        except Exception:
+            pass
+
+    @QtCore.Slot()
+    def stop(self) -> None:
+        self._stop = True
+        try:
+            if self._ser:
+                self._ser.write(b"\x03")
+                self._ser.write(b"\x04")
+                self._ser.write(b"exit\n")
+                try:
+                    self._ser.dtr = False
+                    self._ser.rts = False
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if self._ser:
+                self._ser.close()
+        except Exception:
+            pass
+        self._ser = None
+
+
+class SerialTailWorker(QtCore.QObject):
+    line_received = QtCore.Signal(str)
+    status = QtCore.Signal(str)
+    stopped = QtCore.Signal()
+    file_selected = QtCore.Signal(str)
+
+    def __init__(
+        self,
+        port: str,
+        username: str,
+        password: str,
+        prefill_seconds: int = 0,
+        baud: int = 115200,
+        parent: Optional[QtCore.QObject] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._port = port
+        self._username = username
+        self._password = password
+        self._prefill_seconds = max(0, int(prefill_seconds))
+        self._baud = baud
+        self._stop = False
+        self._ser = None
+        self._buffer = ""
+        self._sent_user = False
+        self._sent_pass = False
+        self._suppress_disconnect = False
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        if serial is None:
+            self.status.emit("pyserial not installed")
+            self.stopped.emit()
+            return
+        try:
+            self._ser = serial.Serial(self._port, self._baud, timeout=0.2, exclusive=True)
+            try:
+                self._ser.dtr = False
+                self._ser.rts = False
+                time.sleep(0.2)
+                self._ser.dtr = True
+                self._ser.rts = True
+            except Exception:
+                pass
+            try:
+                self._ser.reset_input_buffer()
+                self._ser.reset_output_buffer()
+            except Exception:
+                pass
+            self.status.emit(f"Serial connecting: {self._port}")
+        except Exception as exc:
+            self.status.emit(f"Serial connect failed: {exc}")
+            self.stopped.emit()
+            return
+
+        state = "init"
+        start_time = time.time()
+        prefill = self._prefill_seconds
+        tail_cmd = (
+            f"PREFILL={prefill}; "
+            "last=\"\"; pid=\"\"; "
+            "while true; do "
+            "f=$(ls -t /home/pi/ICE_PLANT/data/ctg_frames_*.csv "
+            "/home/pi/ICE_PLANT/data/ctg_frames_sim_*.csv 2>/dev/null | head -n1); "
+            "if [ -n \"$f\" ] && [ \"$f\" != \"$last\" ]; then "
+            "[ -n \"$pid\" ] && kill \"$pid\" 2>/dev/null; "
+            "echo \"TAILING:$f\"; "
+            "if [ \"$PREFILL\" -gt 0 ]; then "
+            "awk -F, -v p=\"$PREFILL\" "
+            "'NR==FNR{if(FNR>1) last=$1; next} "
+            "FNR>1 && last!=\"\" && $1+0>=last-p {print}' "
+            "\"$f\" \"$f\"; "
+            "fi; "
+            "tail -F -n 0 \"$f\" & "
+            "pid=$!; last=\"$f\"; "
+            "fi; "
+            "sleep 1; "
+            "done\n"
+        )
+        login_ok = False
+        current_tail: Optional[str] = None
+        sent_tail = False
+        password_sent_at: Optional[float] = None
+        try:
+            # Trigger banner/prompt once.
+            self._write("\r\n")
+            while not self._stop:
+                elapsed = time.time() - start_time
+                if elapsed > 5 and state == "init":
+                    self.status.emit("Serial: waiting for login prompt...")
+                    state = "login"
+                if elapsed > 20 and state != "tailing":
+                    self.status.emit("Serial login failed: timeout")
+                    self._stop = True
+                    break
+                try:
+                    data = self._ser.read(1024)
+                except Exception as exc:
+                    if not self._suppress_disconnect:
+                        self.status.emit(f"Serial: Disconnected: {exc}")
+                    self._stop = True
+                    break
+                if data:
+                    chunk = data.decode(errors="replace")
+                    self._buffer += chunk
+                    lower_buf = self._buffer.lower()
+                    if not self._sent_user and "login:" in lower_buf:
+                        self.status.emit("Serial: login prompt detected")
+                        self._write(self._username + "\n")
+                        self._sent_user = True
+                        state = "password"
+                    if not self._sent_pass and "password:" in lower_buf and state == "password":
+                        self.status.emit("Serial: password prompt detected")
+                        self._write(self._password + "\n")
+                        self._sent_pass = True
+                        state = "post_password"
+                        password_sent_at = time.time()
+                    lines = self._buffer.splitlines(keepends=True)
+                    if lines and not lines[-1].endswith(("\n", "\r")):
+                        self._buffer = lines[-1]
+                        lines = lines[:-1]
+                    else:
+                        self._buffer = ""
+
+                    for line in lines:
+                        lower = line.lower()
+                        stripped = line.strip()
+                        if state in ("init", "login") and "login:" in lower:
+                            if not self._sent_user:
+                                self.status.emit("Serial: login prompt detected")
+                                self._write(self._username + "\n")
+                                self._sent_user = True
+                            state = "password"
+                            continue
+                        if state == "password" and "password:" in lower:
+                            if not self._sent_pass:
+                                self.status.emit("Serial: password prompt detected")
+                                self._write(self._password + "\n")
+                                self._sent_pass = True
+                            state = "post_password"
+                            password_sent_at = time.time()
+                            continue
+                        if state != "tailing" and stripped.endswith(("$", "#")):
+                            # Shell prompt already present; proceed to tail without waiting for login prompt.
+                            state = "post_password"
+                            password_sent_at = time.time() - 1.0
+                            continue
+                        if "login incorrect" in lower:
+                            self.status.emit("Serial login failed: incorrect credentials")
+                            self._sent_user = False
+                            self._sent_pass = False
+                            state = "login"
+                            continue
+                        if state == "tailing" and line.strip():
+                            if line.startswith("TAILING:"):
+                                path = line.split(":", 1)[1].strip()
+                                if path:
+                                    current_tail = path
+                                    self.status.emit(f"Serial: Tailing {path}")
+                                    self.file_selected.emit(path)
+                                continue
+                            if not login_ok and parse_payload_line(line.strip()):
+                                login_ok = True
+                            self.line_received.emit(line.strip())
+                if state == "post_password" and not sent_tail:
+                    if password_sent_at and (time.time() - password_sent_at) > 0.5:
+                        self._write(tail_cmd)
+                        if not current_tail:
+                            self.status.emit("Serial: waiting for file...")
+                        sent_tail = True
+                        state = "tailing"
+                else:
+                    continue
+        finally:
+            try:
+                if self._ser:
+                    self._ser.close()
+            except Exception:
+                pass
+            self.stopped.emit()
+
+    def _write(self, text: str) -> None:
+        if not self._ser:
+            return
+        try:
+            self._ser.write(text.encode())
+        except Exception:
+            pass
+
+    @QtCore.Slot()
+    def stop(self) -> None:
+        self._stop = True
+        self._suppress_disconnect = True
+        # Attempt to return to login prompt to allow immediate reconnects.
+        try:
+            if self._ser:
+                self._ser.write(b"\x03")
+                self._ser.write(b"\x04")
+                self._ser.write(b"exit\n")
+                try:
+                    self._ser.dtr = False
+                    self._ser.rts = False
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if self._ser:
+                self._ser.close()
+        except Exception:
+            pass
+
+
+class SerialTerminalDialog(QtWidgets.QDialog):
+    def __init__(self, port: str, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Serial Terminal ({port})")
+        self.resize(700, 400)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self._port = port
+        self._thread: Optional[QtCore.QThread] = None
+        self._worker: Optional[SerialWorker] = None
+
+        self._output = QtWidgets.QPlainTextEdit()
+        self._output.setReadOnly(True)
+        self._input = QtWidgets.QLineEdit()
+        self._input.setPlaceholderText("Type command and press Enter")
+
+        self._input.returnPressed.connect(self._send_input)
+
+        controls = QtWidgets.QHBoxLayout()
+        controls.addWidget(self._input, 1)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(self._output, 1)
+        layout.addLayout(controls)
+
+        self._connect()
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[name-defined]
+        self._disconnect()
+        super().closeEvent(event)
+
+    def _append(self, text: str) -> None:
+        self._output.moveCursor(QtGui.QTextCursor.End)
+        self._output.insertPlainText(text)
+        self._output.moveCursor(QtGui.QTextCursor.End)
+
+    def _connect(self) -> None:
+        if self._thread and not self._thread.isRunning():
+            self._thread = None
+            self._worker = None
+        if self._thread:
+            return
+        self._thread = QtCore.QThread()
+        self._worker = SerialWorker(self._port)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.data.connect(self._append)
+        self._worker.status.connect(lambda msg: self._append(f"\n[{msg}]\n"))
+        self._worker.stopped.connect(self._on_stopped)
+        self._thread.start()
+
+    def _disconnect(self) -> None:
+        if self._worker:
+            self._worker.stop()
+        if self._thread:
+            self._thread.quit()
+            self._thread.wait(1000)
+        QtWidgets.QApplication.processEvents()
+        self._thread = None
+        self._worker = None
+
+    def _on_stopped(self) -> None:
+        if self._thread:
+            self._thread.quit()
+            self._thread.wait(1000)
+        self._thread = None
+        self._worker = None
+
+    def _send_input(self) -> None:
+        text = self._input.text()
+        if not text or not self._worker:
+            return
+        self._worker.send(text + "\n")
+        self._input.clear()
 
 class FileCheckWorker(QtCore.QObject):
     result = QtCore.Signal(object)
@@ -553,6 +963,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._worker: Optional[TailWorker] = None
         self._thread: Optional[QtCore.QThread] = None
+        self._serial_worker: Optional[SerialTailWorker] = None
+        self._serial_thread: Optional[QtCore.QThread] = None
         self._static_worker: Optional[StaticWorker] = None
         self._static_thread: Optional[QtCore.QThread] = None
         self._download_worker: Optional[DownloadWorker] = None
@@ -562,7 +974,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._static_view = False
         self._suppress_spec_rows = False
         self._current_remote_file: Optional[str] = None
+        self._serial_connected: Optional[str] = None
+        self._serial_mode = False
+        self._serial_prompted = False
+        self._serial_dialogs: List[QtWidgets.QDialog] = []
         self._last_packet_ts: Optional[float] = None
+        self._data_source: Optional[str] = None
 
         self._signal_map = {
             "hr1": decode_hr1_samples,
@@ -630,6 +1047,11 @@ class MainWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(0, self._auto_connect_if_enabled)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[name-defined]
+        for dialog in list(self._serial_dialogs):
+            try:
+                dialog.close()
+            except Exception:
+                pass
         self._disconnect()
         self._stop_static_worker()
         self._stop_download_worker()
@@ -649,9 +1071,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self._connect_button.setText("Connecting...")
         self._load_button.setEnabled(False)
         self._on_status("Connecting...")
+        serial_port = self._find_serial_gadget()
+        if serial_port and not self._serial_prompted:
+            self._serial_prompted = True
+            choice = QtWidgets.QMessageBox.question(
+                self,
+                "Serial Detected",
+                f"ICEPLANT serial gadget detected on {serial_port}.\n"
+                "Connect via serial instead of remote?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.Yes,
+            )
+            if choice == QtWidgets.QMessageBox.Yes:
+                self._connect_serial_gadget()
+                self._connect_button.setEnabled(True)
+                self._connect_button.setText("Connect")
+                self._load_button.setEnabled(True)
+                return
+        if self._data_source != "remote":
+            self._reset_live_buffers()
         if self._static_view:
             self._reset_live_buffers()
         self._static_view = False
+        if self._serial_mode:
+            self._serial_mode = False
+            self._serial_connected = None
+        if self._serial_thread:
+            self._stop_serial_stream()
+            self._reset_live_buffers()
 
         prefill_seconds = max(MAX_SPEC_WINDOW_SECONDS, WINDOW_SECONDS)
         self._worker = TailWorker(host, DEFAULT_REMOTE_DIR, prefill_seconds=prefill_seconds)
@@ -659,11 +1106,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker.moveToThread(self._thread)
 
         self._thread.started.connect(self._worker.run)
-        self._worker.line_received.connect(self._on_line)
+        self._worker.line_received.connect(lambda line: self._on_line_with_source(line, "remote"))
         self._worker.prefill_done.connect(self._on_prefill_done)
         self._worker.status.connect(self._on_status)
         self._worker.file_selected.connect(self._on_file_selected)
         self._worker.stopped.connect(self._on_worker_stopped)
+        self._data_source = "remote"
         self._thread.start()
 
         self._connected = True
@@ -673,6 +1121,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._suppress_spec_rows = True
 
     def _disconnect(self) -> None:
+        if self._serial_thread:
+            self._stop_serial_stream()
         if self._worker:
             self._worker.stop()
         if self._thread:
@@ -681,6 +1131,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker = None
         self._thread = None
         self._connected = False
+        self._data_source = None
         self._connect_button.setText("Connect")
         self._on_status("Disconnected")
         self._load_button.setEnabled(True)
@@ -692,6 +1143,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker = None
         self._thread = None
         self._connected = False
+        self._data_source = None
         self._connect_button.setText("Connect")
         self._on_status("Disconnected")
         self._load_button.setEnabled(True)
@@ -712,6 +1164,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._load_button.setEnabled(False)
         self._connect_button.setEnabled(False)
         self._static_view = True
+        self._data_source = "static"
 
         self._static_worker = StaticWorker(host, DEFAULT_REMOTE_DIR)
         self._static_thread = QtCore.QThread()
@@ -740,7 +1193,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("File")
-        download_action = QtGui.QAction("Download All Remote CSVs...", self)
+        download_action = QtGui.QAction("Download Data Files...", self)
         download_action.triggered.connect(self._download_all_files)
         file_menu.addAction(download_action)
 
@@ -750,6 +1203,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._autoconnect_action.setChecked(self._settings.value("auto_connect", True, type=bool))
         self._autoconnect_action.toggled.connect(self._on_autoconnect_toggled)
         file_menu.addAction(self._autoconnect_action)
+
+        connection_menu = self.menuBar().addMenu("Connection")
+        serial_connect_action = QtGui.QAction("Connect via Serial Gadget", self)
+        serial_connect_action.triggered.connect(self._connect_serial_gadget)
+        connection_menu.addAction(serial_connect_action)
+        serial_terminal_action = QtGui.QAction("Open Serial Terminal", self)
+        serial_terminal_action.triggered.connect(self._open_serial_terminal)
+        connection_menu.addAction(serial_terminal_action)
 
         view_menu = self.menuBar().addMenu("View")
         theme_menu = view_menu.addMenu("Theme")
@@ -778,6 +1239,101 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_autoconnect_toggled(self, checked: bool) -> None:
         self._settings.setValue("auto_connect", checked)
+
+    def _find_serial_gadget(self) -> Optional[str]:
+        matches = sorted(glob.glob("/dev/tty.usbmodemICEPLANT_*"))
+        if matches:
+            return matches[0]
+        matches = sorted(glob.glob("/dev/cu.usbmodemICEPLANT_*"))
+        return matches[0] if matches else None
+
+    def _connect_serial_gadget(self) -> None:
+        port = self._find_serial_gadget()
+        if not port:
+            QtWidgets.QMessageBox.warning(self, "Serial Connect", "ICEPLANT serial gadget not found.")
+            return
+        if self._serial_thread and not self._serial_thread.isRunning():
+            self._serial_thread = None
+            self._serial_worker = None
+        if self._serial_thread:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Serial Connect",
+                "Already connected via serial. Disconnect first to reconnect.",
+            )
+            return
+        if self._connected:
+            self._disconnect()
+        if self._static_view:
+            self._reset_live_buffers()
+            self._static_view = False
+        else:
+            self._reset_live_buffers()
+        user = self._settings.value("serial_user", "pi")
+        username, ok = QtWidgets.QInputDialog.getText(
+            self, "Serial Login", "Username:", text=str(user)
+        )
+        if not ok or not username:
+            return
+        password, ok = QtWidgets.QInputDialog.getText(
+            self, "Serial Login", "Password:", QtWidgets.QLineEdit.Password
+        )
+        if not ok:
+            return
+        self._settings.setValue("serial_user", username)
+        self._serial_mode = True
+        self._serial_connected = port
+        self._data_source = "serial"
+        self._start_serial_stream(port, username, password)
+
+    def _open_serial_terminal(self) -> None:
+        port = self._find_serial_gadget()
+        if not port:
+            QtWidgets.QMessageBox.warning(self, "Serial Terminal", "ICEPLANT serial gadget not found.")
+            return
+        if serial is None:
+            QtWidgets.QMessageBox.warning(self, "Serial Terminal", "pyserial is not installed.")
+            return
+        if self._serial_thread:
+            # Pause serial data stream and reuse the device for the interactive terminal.
+            self._stop_serial_stream("Serial: Disconnected (terminal took over)")
+        dialog = SerialTerminalDialog(port, self)
+        self._serial_dialogs.append(dialog)
+        dialog.finished.connect(lambda _=0, d=dialog: self._serial_dialogs.remove(d) if d in self._serial_dialogs else None)
+        dialog.show()
+
+    def _start_serial_stream(self, port: str, username: str, password: str) -> None:
+        if serial is None:
+            QtWidgets.QMessageBox.warning(self, "Serial Connect", "pyserial is not installed.")
+            return
+        prefill_seconds = max(MAX_SPEC_WINDOW_SECONDS, WINDOW_SECONDS)
+        self._serial_worker = SerialTailWorker(port, username, password, prefill_seconds=prefill_seconds)
+        self._serial_thread = QtCore.QThread()
+        self._serial_worker.moveToThread(self._serial_thread)
+        self._serial_thread.started.connect(self._serial_worker.run)
+        self._serial_worker.line_received.connect(lambda line: self._on_line_with_source(line, "serial"))
+        self._serial_worker.status.connect(self._on_status)
+        self._serial_worker.file_selected.connect(self._on_file_selected)
+        self._serial_worker.stopped.connect(self._on_serial_stopped)
+        self._serial_thread.start()
+
+    def _stop_serial_stream(self, reason: Optional[str] = None) -> None:
+        if self._serial_worker:
+            self._serial_worker.stop()
+        if self._serial_thread:
+            self._serial_thread.quit()
+            self._serial_thread.wait(1000)
+        self._serial_worker = None
+        self._serial_thread = None
+        self._serial_mode = False
+        self._serial_connected = None
+        if self._data_source == "serial":
+            self._data_source = None
+        if reason:
+            self._on_status(reason)
+
+    def _on_serial_stopped(self) -> None:
+        self._stop_serial_stream()
 
     def _auto_connect_if_enabled(self) -> None:
         if self._connected or self._static_view:
@@ -917,7 +1473,15 @@ class MainWindow(QtWidgets.QMainWindow):
     def _download_all_files(self) -> None:
         if self._download_thread:
             return
-        dest = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Download Folder")
+        dialog = QtWidgets.QFileDialog(self, "Choose Download Folder")
+        dialog.setFileMode(QtWidgets.QFileDialog.Directory)
+        dialog.setOption(QtWidgets.QFileDialog.ShowDirsOnly, True)
+        dialog.setAcceptMode(QtWidgets.QFileDialog.AcceptOpen)
+        dialog.setLabelText(QtWidgets.QFileDialog.Accept, "Choose")
+        if not dialog.exec():
+            return
+        selected = dialog.selectedFiles()
+        dest = selected[0] if selected else ""
         if not dest:
             return
         host = self._host_input.text().strip() or DEFAULT_HOST
@@ -940,7 +1504,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_status(self, message: str) -> None:
         self._status_label.setText(message)
         lower = message.lower()
-        if lower.startswith("disconnected"):
+        if "disconnected" in lower:
             self._status_label.setStyleSheet("color: #d32f2f;")
             self._connect_button.setText("Connect")
             self._connect_button.setEnabled(True)
@@ -948,7 +1512,7 @@ class MainWindow(QtWidgets.QMainWindow):
         elif lower.startswith("connecting"):
             # Neutral state while connecting.
             self._status_label.setStyleSheet("")
-        elif lower.startswith("tailing") or lower.startswith("loading"):
+        elif "tailing" in lower or "loading" in lower:
             if self._simulated_data:
                 self._status_label.setStyleSheet("color: #ff8c00;")
             else:
@@ -958,6 +1522,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._status_label.setStyleSheet("color: #ff8c00;")
             else:
                 self._status_label.setStyleSheet("")
+        if "serial login failed" in lower:
+            QtWidgets.QMessageBox.warning(self, "Serial Login", message)
+            if self._serial_thread:
+                self._stop_serial_stream("Serial: Disconnected")
 
     def _on_download_finished(self) -> None:
         self._stop_download_worker()
@@ -1017,6 +1585,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if parsed is None:
             return
         ts, payload = parsed
+        if self._last_packet_ts is not None and ts < (self._last_packet_ts - 0.5):
+            # Timestamps moved backwards; treat as a fresh stream to avoid visual shifts.
+            self._reset_live_buffers()
         if len(payload) > 34:
             spo2 = payload[34]
             if spo2 != 0:
@@ -1050,6 +1621,14 @@ class MainWindow(QtWidgets.QMainWindow):
             while self._times[sig] and (latest_time - self._times[sig][0]) > history_seconds:
                 self._times[sig].popleft()
                 self._values[sig].popleft()
+        while self._times["spo2"] and (latest_time - self._times["spo2"][0]) > history_seconds:
+            self._times["spo2"].popleft()
+            self._values["spo2"].popleft()
+
+    def _on_line_with_source(self, line: str, source: str) -> None:
+        if self._data_source and self._data_source != source:
+            return
+        self._on_line(line)
 
     def _clear_buffers(self) -> None:
         for sig in self._signal_map:
@@ -1064,6 +1643,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._clear_buffers()
         for sig, line in self._lines.items():
             line.set_data([], [])
+        if hasattr(self, "_spo2_line"):
+            self._spo2_line.set_data([], [])
         self._configure_spectrogram_storage(self._window_spec_cols())
         self._time_plot.canvas.draw_idle()
         self._refresh_spectrogram()
