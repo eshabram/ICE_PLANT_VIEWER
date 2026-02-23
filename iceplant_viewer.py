@@ -408,45 +408,66 @@ class SerialWorker(QtCore.QObject):
             self.stopped.emit()
             return
         try:
-            self._ser = serial.Serial(self._port, self._baud, timeout=0.1, exclusive=True)
+            last_exc: Optional[Exception] = None
+            for _ in range(3):
+                try:
+                    self._ser = serial.Serial(self._port, self._baud, timeout=0.1, exclusive=True)
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    time.sleep(0.2)
+            if self._ser is None:
+                raise last_exc or RuntimeError("Unable to open serial port")
             try:
-                # Toggle DTR/RTS to prompt login banner on connect.
+                # Hard reset getty: drop DTR/RTS long enough to reset, then bring back up.
                 self._ser.dtr = False
                 self._ser.rts = False
-                time.sleep(0.2)
+                time.sleep(2.0)
+                try:
+                    self._ser.reset_input_buffer()
+                except Exception:
+                    pass
                 self._ser.dtr = True
                 self._ser.rts = True
+                time.sleep(0.2)
             except Exception:
                 pass
-            try:
-                self._ser.reset_output_buffer()
-            except Exception:
-                pass
-            # Capture any existing banner first; if none arrives, send a single newline to prompt it.
+            # Wait for banner/login output; if nothing arrives, send a single CR to prompt.
             banner = b""
             start = time.time()
-            while time.time() - start < 1.0:
+            while time.time() - start < 2.5:
                 if self._ser.in_waiting:
                     banner += self._ser.read(self._ser.in_waiting)
                 if banner:
                     break
                 time.sleep(0.05)
-            if banner:
-                self.data.emit(banner.decode(errors="replace"))
-            else:
+            if not banner:
                 try:
-                    self._ser.write(b"\r\n")
+                    self._ser.write(b"\r")
                 except Exception:
                     pass
                 start = time.time()
-                while time.time() - start < 0.6:
+                while time.time() - start < 1.0:
                     if self._ser.in_waiting:
                         banner += self._ser.read(self._ser.in_waiting)
                     if banner:
                         break
                     time.sleep(0.05)
-                if banner:
-                    self.data.emit(banner.decode(errors="replace"))
+            if banner:
+                text = banner.decode(errors="replace")
+                # Collapse consecutive duplicate login prompts in the initial banner.
+                lines = text.splitlines(keepends=True)
+                filtered: List[str] = []
+                last_stripped = None
+                for line in lines:
+                    stripped = line.strip()
+                    if stripped and stripped == last_stripped:
+                        continue
+                    filtered.append(line)
+                    if stripped:
+                        last_stripped = stripped
+                self.data.emit("".join(filtered))
             self.status.emit(f"Connected: {self._port}")
         except Exception as exc:
             self.status.emit(f"Connect failed: {exc}")
@@ -1788,7 +1809,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if self._times["spo2"]:
             self._spo2_ax.set_xlim(x_min, x_max)
-            self._spo2_ax.set_ylim(80, 100)
+            spo2_vals = np.array(self._values["spo2"])
+            if len(spo2_vals):
+                ymin = float(np.nanmin(spo2_vals))
+                ymax = float(np.nanmax(spo2_vals))
+                pad = max(1.0, 0.05 * (ymax - ymin if ymax > ymin else 1.0))
+                self._spo2_ax.set_ylim(ymin - pad, ymax + pad)
         self._time_plot.canvas.draw_idle()
         self._refresh_spectrogram()
 
