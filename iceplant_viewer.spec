@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+import os
+
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+
+PROJECT_DIR = os.path.abspath(os.getcwd())
+ICON_PATH = os.path.join(PROJECT_DIR, "assets", "iceplant.icns")
+
+hiddenimports = []
+hiddenimports += collect_submodules("PySide6")
+hiddenimports += collect_submodules("matplotlib")
+hiddenimports += collect_submodules("numpy")
+
+datas = []
+datas += collect_data_files("matplotlib", include_py_files=True)
+
+a = Analysis(
+    ["iceplant_viewer.py"],
+    pathex=[PROJECT_DIR],
+    binaries=[],
+    datas=datas,
+    hiddenimports=hiddenimports,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+)
+
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name="Ice Plant Viewer",
+    icon=ICON_PATH,
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=False,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    name="Ice Plant Viewer",
+)
+
+app = BUNDLE(
+    coll,
+    name="Ice Plant Viewer.app",
+    icon=ICON_PATH,
+    bundle_identifier="com.iceplant.viewer",
+)

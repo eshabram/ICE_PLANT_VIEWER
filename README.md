@@ -12,3 +12,13 @@ Client-facing viewer for the ICE_PLANT remote monitoring dongle.
 
 ## Live Prefill Behavior
 On connect, the app fetches prior data from the current remote file (based on timestamps) to fill the FFT window. The waterfall display itself starts from the top and only shows rows from live samples.
+
+## macOS Build (PyInstaller)
+1. Install build deps:
+   - `pip install pyinstaller`
+2. Build:
+   - `bash scripts/build_macos.sh`
+3. Output:
+   - `dist/Ice Plant Viewer.app`
+
+The macOS menu bar app name comes from the bundle; the `.app` name here is what will display.

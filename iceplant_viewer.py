@@ -900,7 +900,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._host_input = QtWidgets.QLineEdit()
         self._host_input.setPlaceholderText("pi@raspberrypi or 192.168.1.10")
-        self._host_input.setText(self._settings.value("recent_host", DEFAULT_HOST))
+        if getattr(sys, "frozen", False):
+            self._host_input.setText(DEFAULT_HOST)
+        else:
+            self._host_input.setText(self._settings.value("recent_host", DEFAULT_HOST))
 
         self._connect_button = QtWidgets.QPushButton("Connect")
         self._connect_button.clicked.connect(self._toggle_connection)
@@ -909,6 +912,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._load_button.clicked.connect(self._load_latest)
 
         self._status_label = QtWidgets.QLabel("Disconnected")
+        self._status_message = "Disconnected"
+        self._status_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred
+        )
 
         self._build_menu()
 
@@ -1551,7 +1558,8 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.critical(self, "Download Error", message)
 
     def _on_status(self, message: str) -> None:
-        self._status_label.setText(message)
+        self._status_message = message
+        self._update_status_label()
         lower = message.lower()
         if "disconnected" in lower:
             self._status_label.setStyleSheet("color: #d32f2f;")
@@ -1575,6 +1583,17 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Serial Login", message)
             if self._serial_thread:
                 self._stop_serial_stream("Serial: Disconnected")
+
+    def _update_status_label(self) -> None:
+        metrics = self._status_label.fontMetrics()
+        # Reserve a little space for layout spacing.
+        max_width = max(50, self._status_label.width() - 8)
+        elided = metrics.elidedText(self._status_message, QtCore.Qt.ElideRight, max_width)
+        self._status_label.setText(elided)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # type: ignore[name-defined]
+        super().resizeEvent(event)
+        self._update_status_label()
 
     def _on_download_finished(self) -> None:
         self._stop_download_worker()
@@ -2035,7 +2054,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 def main() -> None:
+    app_name = "Ice Plant Viewer"
+    QtCore.QCoreApplication.setApplicationName(app_name)
+    QtCore.QCoreApplication.setOrganizationName("ICE_PLANT")
     app = QtWidgets.QApplication(sys.argv)
+    if hasattr(app, "setApplicationDisplayName"):
+        app.setApplicationDisplayName(app_name)
     window = MainWindow()
     window.resize(1100, 700)
     window.show()
