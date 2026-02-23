@@ -29,15 +29,19 @@ The macOS menu bar app name comes from the bundle; the `.app` name here is what 
    - If Homebrew link conflicts, run: `brew link --overwrite create-dmg`
 2. Build the app (see macOS Build above).
 3. Create DMG:
-   - `create-dmg \`
-     `  --volname "Ice Plant Viewer" \`
-     `  --window-pos 200 120 \`
-     `  --window-size 600 400 \`
-     `  --icon-size 100 \`
-     `  --icon "Ice Plant Viewer.app" 180 170 \`
-     `  --app-drop-link 420 170 \`
-     `  "Ice-Plant-Viewer.dmg" \`
-     `  "dist/Ice Plant Viewer.app"`
+   ```bash
+   # If the DMG already exists, delete it first:
+   #   rm -f "Ice-Plant-Viewer.dmg"
+   create-dmg \
+     --volname "Ice Plant Viewer" \
+     --window-pos 200 120 \
+     --window-size 600 400 \
+     --icon-size 100 \
+     --icon "Ice Plant Viewer.app" 180 170 \
+     --app-drop-link 420 170 \
+     "Ice-Plant-Viewer.dmg" \
+     "dist/Ice Plant Viewer.app"
+   ```
 
 Fallback (simple DMG, no layout):
 - `hdiutil create -volname "Ice Plant Viewer" -srcfolder "dist/Ice Plant Viewer.app" -ov -format UDZO "Ice-Plant-Viewer.dmg"`
