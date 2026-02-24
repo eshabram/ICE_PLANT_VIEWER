@@ -10,50 +10,29 @@ Client-facing viewer for the ICE_PLANT remote monitoring dongle.
 - `Spec Window (s)`: FFT window length (16, 32, 60, 180, 300 seconds). Longer windows give better frequency resolution.
 - `Freq Range (Hz)`: Display range (0–0.5, 0–1.0, 0–2.0 Hz).
 
-## Live Prefill Behavior
-On connect, the app fetches prior data from the current remote file (based on timestamps) to fill the FFT window. The waterfall display itself starts from the top and only shows rows from live samples.
+## MacOS Release (App + DMG)
+Preferred path (automated, uses create-dmg):
+```bash
+bash scripts/release_macos.sh
+```
 
-## macOS Build (PyInstaller)
-1. Install build deps:
-   - `pip install pyinstaller`
-2. Build:
-   - `bash scripts/build_macos.sh`
-3. Output:
-   - `dist/Ice Plant Viewer.app`
+Options:
+- `--no-bump` to keep the current version
+- `--version X.Y.Z` to set an explicit version
 
+Note: create-dmg uses Finder during layout, so it will open a window while building the DMG.
+
+Examples:
+```bash
+bash scripts/release_macos.sh --no-bump
+bash scripts/release_macos.sh --version 0.2.0
+```
+
+Manual build/install steps are documented in `scripts/build_macos.sh` and `scripts/release_macos.sh`.
 The macOS menu bar app name comes from the bundle; the `.app` name here is what will display.
 
-## macOS Installer (DMG, Unsigned)
-1. Install `create-dmg`:
-   - `brew install create-dmg`
-   - If Homebrew link conflicts, run: `brew link --overwrite create-dmg`
-2. Build the app (see macOS Build above).
-3. Create DMG:
-   ```bash
-   # If the DMG already exists, delete it first:
-   #   rm -f "Ice-Plant-Viewer.dmg"
-   create-dmg \
-     --volname "Ice Plant Viewer" \
-     --window-pos 200 120 \
-     --window-size 600 400 \
-     --icon-size 100 \
-     --icon "Ice Plant Viewer.app" 180 170 \
-     --app-drop-link 420 170 \
-     "Ice-Plant-Viewer.dmg" \
-     "dist/Ice Plant Viewer.app"
-   ```
-
-Fallback (simple DMG, no layout):
-- `hdiutil create -volname "Ice Plant Viewer" -srcfolder "dist/Ice Plant Viewer.app" -ov -format UDZO "Ice-Plant-Viewer.dmg"`
-
-## Build Artifacts (Git)
-Do not commit build outputs:
-- `dist/`
-- `build/`
-
-If already tracked:
-1. `git rm -r --cached dist build`
-2. Add to `.gitignore`
-
-## Packaged App Defaults
-The packaged app does not persist your personal host/IP in the build. It always starts with the default host in the UI.
+## Versioning
+We use semantic versioning: `MAJOR.MINOR.PATCH`.
+- Increment `MAJOR` for breaking changes
+- Increment `MINOR` for new features
+- Increment `PATCH` for fixes and small changes

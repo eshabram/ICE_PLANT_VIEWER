@@ -4,7 +4,10 @@ import os
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 PROJECT_DIR = os.path.abspath(os.getcwd())
-ICON_PATH = os.path.join(PROJECT_DIR, "assets", "iceplant.icns")
+APPLE_ICON_PATH = os.path.join(PROJECT_DIR, "assets", "ice-plant-apple.icns")
+DEFAULT_ICON_PATH = os.path.join(PROJECT_DIR, "assets", "ice_plant.icns")
+ICON_PATH = APPLE_ICON_PATH if os.path.exists(APPLE_ICON_PATH) else DEFAULT_ICON_PATH
+ICON_BASENAME = "ice-plant-apple" if os.path.exists(APPLE_ICON_PATH) else "ice_plant"
 
 hiddenimports = []
 hiddenimports += collect_submodules("PySide6")
@@ -15,7 +18,7 @@ datas = []
 datas += collect_data_files("matplotlib", include_py_files=True)
 
 a = Analysis(
-    ["iceplant_viewer.py"],
+    ["ice_plant_viewer.py"],
     pathex=[PROJECT_DIR],
     binaries=[],
     datas=datas,
@@ -56,5 +59,8 @@ app = BUNDLE(
     coll,
     name="Ice Plant Viewer.app",
     icon=ICON_PATH,
-    bundle_identifier="com.iceplant.viewer",
+    bundle_identifier="com.ice-plant.viewer",
+    info_plist={
+        "CFBundleIconFile": ICON_BASENAME,
+    },
 )

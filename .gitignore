@@ -6,4 +6,4 @@ data/*
 .DS_Store
 **/.DS_Store
 **/*.dmg
-
+**/*AGENTS.md

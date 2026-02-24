@@ -35,6 +35,7 @@ WINDOW_SECONDS = 120
 MAX_SPEC_WINDOW_SECONDS = 300
 REFRESH_SECONDS = 0.5
 DEFAULT_SPEC_WINDOW_SECONDS = 16
+APP_VERSION = "0.1.0"
 
 
 def decode_hr_sample(hi: int, lo: int) -> Optional[float]:
@@ -888,7 +889,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("ICE PLANT Viewer")
+        self.setWindowTitle(f"Ice Plant Viewer v{APP_VERSION}")
         if not hasattr(self, "_update_visibility"):
             self._update_visibility = lambda: None
 
@@ -1249,6 +1250,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._serial_terminal_action = serial_terminal_action
         connection_menu.addAction(serial_terminal_action)
 
+        help_menu = self.menuBar().addMenu("Help")
+        about_action = QtGui.QAction("About Ice Plant Viewer", self)
+        about_action.triggered.connect(self._show_about)
+        help_menu.addAction(about_action)
+
         view_menu = self.menuBar().addMenu("View")
         theme_menu = view_menu.addMenu("Theme")
 
@@ -1276,6 +1282,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_autoconnect_toggled(self, checked: bool) -> None:
         self._settings.setValue("auto_connect", checked)
+
+    def _show_about(self) -> None:
+        QtWidgets.QMessageBox.information(
+            self,
+            "About Ice Plant Viewer",
+            f"Ice Plant Viewer\nVersion {APP_VERSION}",
+        )
 
     def _find_serial_gadget(self) -> Optional[str]:
         matches = sorted(glob.glob("/dev/tty.usbmodemICEPLANT_*"))
