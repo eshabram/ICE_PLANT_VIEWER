@@ -66,6 +66,16 @@ def decode_mhr_samples(payload: List[int]) -> List[Optional[float]]:
     return decode_hr_samples(payload, 19)
 
 
+def decode_toco_samples(payload: List[int]) -> List[Optional[float]]:
+    if len(payload) < 31:
+        return []
+    samples = []
+    for i in range(27, 31):
+        value = payload[i]
+        samples.append(value * 0.5)
+    return samples
+
+
 def parse_payload_line(line: str) -> Optional[Tuple[float, List[int]]]:
     row = line.strip().split(",", 2)
     if len(row) < 3 or row[0] == "timestamp":
@@ -842,14 +852,19 @@ class FileCheckWorker(QtCore.QObject):
 
 
 class PlotWidget(QtWidgets.QWidget):
-    def __init__(self, title: str, parent: Optional[QtWidgets.QWidget] = None) -> None:
+    def __init__(
+        self,
+        title: str,
+        parent: Optional[QtWidgets.QWidget] = None,
+        ylabel: str = "bpm",
+    ) -> None:
         super().__init__(parent)
         self._figure = Figure(figsize=(8, 4))
         self.canvas = FigureCanvas(self._figure)
         self.ax = self._figure.add_subplot(111)
         self.ax.set_title(title)
         self.ax.set_xlabel("time")
-        self.ax.set_ylabel("bpm")
+        self.ax.set_ylabel(ylabel)
         self.ax.xaxis_date()
         self.ax.xaxis.set_major_locator(mdates.AutoDateLocator())
         self.ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
@@ -930,6 +945,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._spec_freq_range = self._settings.value("spec_freq_range", "0-2.0")
         if self._spec_freq_range not in ("0-0.5", "0-1.0", "0-2.0"):
             self._spec_freq_range = "0-2.0"
+        self._spec_scale = self._settings.value("spec_scale", "absolute")
+        if self._spec_scale not in ("absolute", "relative"):
+            self._spec_scale = "absolute"
         self._spec_nfft = int(self._spec_window_seconds * SAMPLE_RATE)
         self._spec_hop = max(4, self._spec_nfft // 8)
 
@@ -939,26 +957,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self._hr1_toggle = QtWidgets.QCheckBox("HR1")
         self._hr2_toggle = QtWidgets.QCheckBox("HR2")
         self._mhr_toggle = QtWidgets.QCheckBox("MHR")
+        self._toco_toggle = QtWidgets.QCheckBox("TOCO")
         self._spo2_toggle = QtWidgets.QCheckBox("SpO2")
         self._hr1_toggle.setChecked(self._settings.value("show_hr1", True, type=bool))
         self._hr2_toggle.setChecked(self._settings.value("show_hr2", True, type=bool))
         self._mhr_toggle.setChecked(self._settings.value("show_mhr", True, type=bool))
+        self._toco_toggle.setChecked(self._settings.value("show_toco", True, type=bool))
         self._spo2_toggle.setChecked(self._settings.value("show_spo2", True, type=bool))
         # Use lambdas so the attribute lookup happens at emit time.
         self._hr1_toggle.toggled.connect(lambda _checked=False: self._update_visibility_wrapper())
         self._hr2_toggle.toggled.connect(lambda _checked=False: self._update_visibility_wrapper())
         self._mhr_toggle.toggled.connect(lambda _checked=False: self._update_visibility_wrapper())
+        self._toco_toggle.toggled.connect(lambda _checked=False: self._update_visibility_wrapper())
         self._spo2_toggle.toggled.connect(lambda _checked=False: self._update_visibility_wrapper())
 
         self._tabs = QtWidgets.QTabWidget()
         self._time_plot = PlotWidget("HR (bpm)")
         self._tabs.addTab(self._time_plot, "Time Domain")
-
-        spec_tab = QtWidgets.QWidget()
-        self._spec_layout = QtWidgets.QGridLayout(spec_tab)
-        self._spec_layout.setContentsMargins(0, 0, 0, 0)
-        self._spec_layout.setSpacing(8)
-        self._tabs.addTab(spec_tab, "Spectrogram")
+        self._toco_plot = PlotWidget("TOCO", ylabel="TOCO")
+        self._tabs.addTab(self._toco_plot, "TOCO")
 
         top_controls = QtWidgets.QHBoxLayout()
         top_controls.addWidget(QtWidgets.QLabel("Host:"))
@@ -972,22 +989,8 @@ class MainWindow(QtWidgets.QMainWindow):
         toggles.addWidget(self._hr1_toggle)
         toggles.addWidget(self._hr2_toggle)
         toggles.addWidget(self._mhr_toggle)
+        toggles.addWidget(self._toco_toggle)
         toggles.addWidget(self._spo2_toggle)
-        self._spec_nfft_combo = QtWidgets.QComboBox()
-        self._spec_nfft_combo.addItems(["16", "32", "60", "180", "300"])
-        self._spec_nfft_combo.setCurrentText(str(self._spec_window_seconds))
-        self._spec_nfft_combo.currentTextChanged.connect(self._on_spec_window_changed)
-
-        self._spec_freq_combo = QtWidgets.QComboBox()
-        self._spec_freq_combo.addItems(["0-0.5", "0-1.0", "0-2.0"])
-        self._spec_freq_combo.setCurrentText(self._spec_freq_range)
-        self._spec_freq_combo.currentTextChanged.connect(self._on_spec_freq_changed)
-        toggles.addSpacing(12)
-        toggles.addWidget(QtWidgets.QLabel("Spec Window (s):"))
-        toggles.addWidget(self._spec_nfft_combo)
-        toggles.addSpacing(12)
-        toggles.addWidget(QtWidgets.QLabel("Freq Range (Hz):"))
-        toggles.addWidget(self._spec_freq_combo)
         toggles.addStretch(1)
 
         container = QtWidgets.QWidget()
@@ -1022,36 +1025,26 @@ class MainWindow(QtWidgets.QMainWindow):
             "hr1": decode_hr1_samples,
             "hr2": decode_hr2_samples,
             "mhr": decode_mhr_samples,
+            "toco": decode_toco_samples,
         }
 
         self._times: Dict[str, Deque[float]] = {
             "hr1": deque(),
             "hr2": deque(),
             "mhr": deque(),
+            "toco": deque(),
             "spo2": deque(),
         }
         self._values: Dict[str, Deque[float]] = {
             "hr1": deque(),
             "hr2": deque(),
             "mhr": deque(),
+            "toco": deque(),
             "spo2": deque(),
         }
 
-        self._spec_plots = {
-            "hr1": SpectrogramWidget(),
-            "hr2": SpectrogramWidget(),
-            "mhr": SpectrogramWidget(),
-        }
-        self._spec_plots["hr1"].ax.set_title("HR1 Spectrogram")
-        self._spec_plots["hr2"].ax.set_title("HR2 Spectrogram")
-        self._spec_plots["mhr"].ax.set_title("MHR Spectrogram")
+        self._spec_plots = {}
         self._simulated_data = False
-
-        for sig in ("hr1", "hr2", "mhr"):
-            self._spec_plots[sig].setSizePolicy(
-                QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
-            )
-            self._spec_layout.addWidget(self._spec_plots[sig], 0, 0)
 
         self._spec_bins = self._spec_nfft // 2 + 1
         self._spec_norm = mcolors.Normalize(vmin=0.0, vmax=1.0)
@@ -1067,18 +1060,21 @@ class MainWindow(QtWidgets.QMainWindow):
             "hr2": self._time_plot.ax.plot([], [], lw=1, color="tab:orange", label="HR2")[0],
             "mhr": self._time_plot.ax.plot([], [], lw=1, color="tab:green", label="MHR")[0],
         }
+
         self._spo2_ax = self._time_plot.ax.twinx()
         self._spo2_ax.set_ylabel("SpO2")
         self._spo2_line = self._spo2_ax.plot([], [], lw=1, color="tab:red", label="SpO2")[0]
         self._time_plot.ax.legend(loc="upper left")
         self._spo2_ax.legend(loc="upper right")
+        self._toco_line = self._toco_plot.ax.plot([], [], lw=1.5, color="#8b5a2b", label="TOCO")[0]
+        self._toco_fill = self._toco_plot.ax.fill_between([], [], 0, color="#c07a3a", alpha=0.25)
+        self._toco_plot.ax.legend(loc="upper left")
 
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(int(REFRESH_SECONDS * 1000))
         self._timer.timeout.connect(self._refresh_plots)
         self._timer.start()
 
-        self._configure_spectrogram_storage(self._window_spec_cols())
         self._set_theme_mode(self._theme_mode)
         self._update_visibility()
         QtCore.QTimer.singleShot(0, self._auto_connect_if_enabled)
@@ -1137,7 +1133,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._stop_serial_stream()
             self._reset_live_buffers()
 
-        prefill_seconds = max(MAX_SPEC_WINDOW_SECONDS, WINDOW_SECONDS)
+        prefill_seconds = WINDOW_SECONDS
         self._worker = TailWorker(host, DEFAULT_REMOTE_DIR, prefill_seconds=prefill_seconds)
         self._thread = QtCore.QThread()
         self._worker.moveToThread(self._thread)
@@ -1372,7 +1368,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if serial is None:
             QtWidgets.QMessageBox.warning(self, "Serial Connect", "pyserial is not installed.")
             return
-        prefill_seconds = max(MAX_SPEC_WINDOW_SECONDS, WINDOW_SECONDS)
+        prefill_seconds = WINDOW_SECONDS
         self._serial_worker = SerialTailWorker(port, username, password, prefill_seconds=prefill_seconds)
         self._serial_thread = QtCore.QThread()
         self._serial_worker.moveToThread(self._serial_thread)
@@ -1435,6 +1431,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._settings.setValue("spec_freq_range", self._spec_freq_range)
         self._refresh_spectrogram()
 
+    def _on_spec_scale_changed(self, index: int) -> None:
+        value = self._spec_scale_combo.itemData(index)
+        if value not in ("absolute", "relative"):
+            return
+        if value == self._spec_scale:
+            return
+        self._spec_scale = value
+        self._settings.setValue("spec_scale", self._spec_scale)
+        self._refresh_spectrogram()
+
     def _set_theme_mode(self, mode: str) -> None:
         mode = mode if mode in {"light", "dark"} else "dark"
         self._theme_mode = mode
@@ -1488,12 +1494,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_axes_theme(self._time_plot.ax)
         if hasattr(self, "_spo2_ax"):
             self._apply_axes_theme(self._spo2_ax)
-        for widget in self._spec_plots.values():
-            self._apply_axes_theme(widget.ax)
+        self._apply_axes_theme(self._toco_plot.ax)
 
         self._time_plot.canvas.draw_idle()
-        for widget in self._spec_plots.values():
-            widget.canvas.draw_idle()
+        self._toco_plot.canvas.draw_idle()
 
 
     def _apply_axes_theme(self, ax: mpl.axes.Axes) -> None:  # type: ignore[name-defined]
@@ -1505,6 +1509,8 @@ class MainWindow(QtWidgets.QMainWindow):
         ax.yaxis.label.set_color(mpl.rcParams["axes.labelcolor"])
         ax.tick_params(colors=mpl.rcParams["xtick.color"])
         ax.title.set_color(mpl.rcParams["axes.titlecolor"])
+        if ax is self._toco_plot.ax:
+            ax.grid(True, which="both", axis="y", alpha=0.35)
         text_color = self._resolved_text_color()
         for text in ax.findobj(mtext.Text):
             if text.get_color() == "auto":
@@ -1623,17 +1629,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _apply_plot_titles(self) -> None:
         if self._simulated_data:
             self._time_plot.ax.set_title("Simulated HR (bpm)")
-            self._spec_plots["hr1"].ax.set_title("Simulated HR1 Spectrogram")
-            self._spec_plots["hr2"].ax.set_title("Simulated HR2 Spectrogram")
-            self._spec_plots["mhr"].ax.set_title("Simulated MHR Spectrogram")
+            self._toco_plot.ax.set_title("Simulated TOCO")
         else:
             self._time_plot.ax.set_title("HR (bpm)")
-            self._spec_plots["hr1"].ax.set_title("HR1 Spectrogram")
-            self._spec_plots["hr2"].ax.set_title("HR2 Spectrogram")
-            self._spec_plots["mhr"].ax.set_title("MHR Spectrogram")
+            self._toco_plot.ax.set_title("TOCO")
         self._time_plot.canvas.draw_idle()
-        for widget in self._spec_plots.values():
-            widget.canvas.draw_idle()
+        self._toco_plot.canvas.draw_idle()
 
     def _stop_download_worker(self) -> None:
         if self._download_thread:
@@ -1648,11 +1649,6 @@ class MainWindow(QtWidgets.QMainWindow):
         for line in lines:
             self._on_line(line)
         self._static_loading = False
-        total_samples = max((len(self._values[s]) for s in self._signal_map), default=0)
-        if total_samples > 0:
-            cols = max(1, int(np.ceil(total_samples / PACKET_SAMPLES)))
-            self._configure_spectrogram_storage(max(cols, 10))
-            self._rebuild_spectrogram_all()
         self._refresh_plots()
         self._status_label.setText("Loaded latest file")
         self._connect_button.setEnabled(True)
@@ -1685,8 +1681,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 if bpm is None:
                     bpm = 0.0
                 self._values[sig].append(bpm)
-            if not self._static_loading and not self._suppress_spec_rows:
-                self._process_spectrogram(sig, samples, sample_times)
         self._last_packet_ts = ts
 
         latest_time = max((times[-1] for times in self._times.values() if times), default=None)
@@ -1712,10 +1706,17 @@ class MainWindow(QtWidgets.QMainWindow):
         for sig in self._signal_map:
             self._times[sig].clear()
             self._values[sig].clear()
+        if "toco" in self._times:
+            self._times["toco"].clear()
+        if "toco" in self._values:
+            self._values["toco"].clear()
         self._times["spo2"].clear()
         self._values["spo2"].clear()
         # Spectrogram data is stored in a ring buffer.
         self._last_packet_ts = None
+        if hasattr(self, "_spec_last_sample_end"):
+            for sig in self._spec_last_sample_end:
+                self._spec_last_sample_end[sig] = 0
 
     def _reset_live_buffers(self) -> None:
         self._clear_buffers()
@@ -1723,23 +1724,33 @@ class MainWindow(QtWidgets.QMainWindow):
             line.set_data([], [])
         if hasattr(self, "_spo2_line"):
             self._spo2_line.set_data([], [])
-        self._configure_spectrogram_storage(self._window_spec_cols())
+        if hasattr(self, "_toco_line"):
+            self._toco_line.set_data([], [])
+        if hasattr(self, "_toco_fill") and self._toco_fill in self._toco_plot.ax.collections:
+            self._toco_fill.remove()
         self._time_plot.canvas.draw_idle()
-        self._refresh_spectrogram()
+        self._toco_plot.canvas.draw_idle()
 
     def _process_spectrogram(self, sig: str, samples: List[float], times: List[float]) -> None:
         if not samples or not times:
             return
         nfft = self._spec_nfft
         values = list(self._values[sig])
+        times_all = list(self._times[sig])
         if len(values) < nfft:
             return
-        seg = np.asarray(values[-nfft:], dtype=float)
+        last_end = self._spec_last_sample_end.get(sig, 0)
+        if last_end == 0:
+            last_end = nfft
+        total = len(values)
         window = np.hanning(nfft)
-        seg = seg - np.mean(seg)
-        fft_vals = np.fft.rfft(seg * window)
-        power = np.abs(fft_vals) ** 2
-        self._append_spec_column(sig, power, times[-1])
+        while last_end <= total:
+            seg = np.asarray(values[last_end - nfft:last_end], dtype=float)
+            power = self._compute_psd(seg, window)
+            timestamp = float(times_all[last_end - 1])
+            self._append_spec_column(sig, power, timestamp)
+            last_end += self._spec_hop
+        self._spec_last_sample_end[sig] = last_end - self._spec_hop
 
     def _rebuild_spectrogram(self, sig: str) -> None:
         self._spec_col_index[sig] = 0
@@ -1747,21 +1758,37 @@ class MainWindow(QtWidgets.QMainWindow):
         self._spec_next_index[sig] = 0
         self._spec_data[sig][:] = np.nan
         self._spec_times[sig][:] = 0.0
+        self._spec_last_sample_end[sig] = 0
 
         values = list(self._values[sig])
         times = list(self._times[sig])
         if not values or not times:
             return
-        for start in range(0, len(values), PACKET_SAMPLES):
-            chunk = values[start : start + PACKET_SAMPLES]
-            chunk_times = times[start : start + PACKET_SAMPLES]
-            if not chunk or not chunk_times:
-                continue
-            self._process_spectrogram(sig, chunk, chunk_times)
+        series = np.asarray(values, dtype=float)
+        tseries = np.asarray(times, dtype=float)
+        _, tcols, sxx = self._compute_spectrogram(series, tseries)
+        if sxx.size == 0:
+            return
+        for idx in range(sxx.shape[1]):
+            self._append_spec_column(sig, sxx[:, idx], float(tcols[idx]))
+        self._spec_last_sample_end[sig] = len(values)
 
     def _rebuild_spectrogram_all(self) -> None:
         for sig in self._signal_map:
             self._rebuild_spectrogram(sig)
+
+    def _compute_psd(self, segment: np.ndarray, window: np.ndarray) -> np.ndarray:
+        nfft = len(window)
+        seg = segment - np.mean(segment)
+        fft_vals = np.fft.rfft(seg * window)
+        power = (np.abs(fft_vals) ** 2) / (SAMPLE_RATE * np.sum(window ** 2))
+        if nfft % 2 == 0:
+            if power.size > 2:
+                power[1:-1] *= 2.0
+        else:
+            if power.size > 1:
+                power[1:] *= 2.0
+        return power
 
     def _compute_spectrogram(self, series: np.ndarray, times: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         n = len(series)
@@ -1779,14 +1806,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if n < nfft:
             padded = np.zeros(nfft, dtype=float)
             padded[:n] = series
-            fft_vals = np.fft.rfft(padded * window)
-            cols.append(np.abs(fft_vals) ** 2)
+            cols.append(self._compute_psd(padded, window))
             tcols.append(times[-1])
         else:
             for start in range(0, n - nfft + 1, hop):
                 segment = series[start : start + nfft]
-                fft_vals = np.fft.rfft(segment * window)
-                cols.append(np.abs(fft_vals) ** 2)
+                cols.append(self._compute_psd(segment, window))
                 tcols.append(times[start + nfft - 1])
 
         if not cols:
@@ -1810,23 +1835,17 @@ class MainWindow(QtWidgets.QMainWindow):
             line.set_visible(sig in active)
         self._spo2_line.set_visible(self._spo2_toggle.isChecked())
         self._spo2_ax.set_visible(self._spo2_toggle.isChecked())
-        for sig, widget in self._spec_plots.items():
-            widget.setVisible(sig in active)
-        self._reflow_spectrogram_layout(active)
-        self._adjust_spec_margins(len(active))
+        self._toco_line.set_visible(self._toco_toggle.isChecked())
         self._settings.setValue("show_hr1", self._hr1_toggle.isChecked())
         self._settings.setValue("show_hr2", self._hr2_toggle.isChecked())
         self._settings.setValue("show_mhr", self._mhr_toggle.isChecked())
+        self._settings.setValue("show_toco", self._toco_toggle.isChecked())
         self._settings.setValue("show_spo2", self._spo2_toggle.isChecked())
         self._time_plot.canvas.draw_idle()
-        self._refresh_spectrogram()
+        self._toco_plot.canvas.draw_idle()
 
     def _refresh_plots(self) -> None:
         active = self._active_signals()
-        if not active:
-            self._time_plot.canvas.draw_idle()
-            return
-
         base_time = None
         latest_time = None
         for sig in active:
@@ -1835,8 +1854,20 @@ class MainWindow(QtWidgets.QMainWindow):
                     base_time = self._times[sig][0]
                 if latest_time is None or self._times[sig][-1] > latest_time:
                     latest_time = self._times[sig][-1]
-
+        if self._times.get("toco"):
+            if self._times["toco"]:
+                if base_time is None or self._times["toco"][0] < base_time:
+                    base_time = self._times["toco"][0]
+                if latest_time is None or self._times["toco"][-1] > latest_time:
+                    latest_time = self._times["toco"][-1]
+        if self._times.get("spo2"):
+            if self._times["spo2"]:
+                if base_time is None or self._times["spo2"][0] < base_time:
+                    base_time = self._times["spo2"][0]
+                if latest_time is None or self._times["spo2"][-1] > latest_time:
+                    latest_time = self._times["spo2"][-1]
         if base_time is None or latest_time is None:
+            self._time_plot.canvas.draw_idle()
             return
 
         for sig in active:
@@ -1844,11 +1875,30 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             x = mdates.date2num([datetime.fromtimestamp(t) for t in self._times[sig]])
             y = np.array(self._values[sig])
-            self._lines[sig].set_data(x[: len(y)], y)
+            count = min(len(x), len(y))
+            self._lines[sig].set_data(x[:count], y[:count])
         if self._times["spo2"]:
             x_spo2 = mdates.date2num([datetime.fromtimestamp(t) for t in self._times["spo2"]])
             y_spo2 = np.array(self._values["spo2"])
-            self._spo2_line.set_data(x_spo2[: len(y_spo2)], y_spo2)
+            count = min(len(x_spo2), len(y_spo2))
+            self._spo2_line.set_data(x_spo2[:count], y_spo2[:count])
+        if self._times["toco"]:
+            x_toco = mdates.date2num([datetime.fromtimestamp(t) for t in self._times["toco"]])
+            y_toco = np.array(self._values["toco"])
+            count = min(len(x_toco), len(y_toco))
+            if count > 0:
+                x_slice = x_toco[:count]
+                y_slice = y_toco[:count]
+                self._toco_line.set_data(x_slice, y_slice)
+                if hasattr(self, "_toco_fill") and self._toco_fill in self._toco_plot.ax.collections:
+                    self._toco_fill.remove()
+                self._toco_fill = self._toco_plot.ax.fill_between(
+                    x_slice,
+                    y_slice,
+                    0,
+                    color="#c07a3a",
+                    alpha=0.25,
+                )
 
         if self._static_view:
             x_min = mdates.date2num(datetime.fromtimestamp(base_time))
@@ -1867,8 +1917,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._times["spo2"]:
             self._spo2_ax.set_xlim(x_min, x_max)
             self._spo2_ax.set_ylim(70, 100)
+        if self._times["toco"]:
+            self._toco_plot.ax.set_xlim(x_min, x_max)
+            finite = y_toco[np.isfinite(y_toco)] if self._times["toco"] else np.array([])
+            if finite.size:
+                ymax = float(np.percentile(finite, 99))
+                ymax = max(10.0, ymax * 1.2)
+                self._toco_plot.ax.set_ylim(0, ymax)
+            else:
+                self._toco_plot.ax.set_ylim(0, 100)
         self._time_plot.canvas.draw_idle()
-        self._refresh_spectrogram()
+        self._toco_plot.canvas.draw_idle()
 
     def _spec_title(self, sig: str) -> str:
         base = f"{sig.upper()} Spectrogram"
@@ -1907,12 +1966,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
             freqs = np.fft.rfftfreq(self._spec_nfft, d=1.0 / SAMPLE_RATE)
             spec_power = 10 * np.log10(data + 1e-12)
-            # Normalize each time slice so relative spectral shape is visible.
-            valid_rows = np.isfinite(spec_power).any(axis=1, keepdims=True)
-            row_max = np.zeros((spec_power.shape[0], 1), dtype=spec_power.dtype)
-            if np.any(valid_rows):
-                row_max[valid_rows[:, 0]] = np.nanmax(spec_power[valid_rows[:, 0]], axis=1, keepdims=True)
-            spec_power = spec_power - row_max
+            if self._spec_scale == "relative":
+                # Normalize each time slice so relative spectral shape is visible.
+                valid_rows = np.isfinite(spec_power).any(axis=1, keepdims=True)
+                row_max = np.zeros((spec_power.shape[0], 1), dtype=spec_power.dtype)
+                if np.any(valid_rows):
+                    row_max[valid_rows[:, 0]] = np.nanmax(spec_power[valid_rows[:, 0]], axis=1, keepdims=True)
+                spec_power = spec_power - row_max
             newest_first = spec_power[::-1, :]
 
             if self._spec_freq_range == "0-0.5":
@@ -2008,6 +2068,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._spec_col_index = {"hr1": 0, "hr2": 0, "mhr": 0}
         self._spec_filled = {"hr1": 0, "hr2": 0, "mhr": 0}
         self._spec_next_index = {"hr1": 0, "hr2": 0, "mhr": 0}
+        self._spec_last_sample_end = {"hr1": 0, "hr2": 0, "mhr": 0}
 
     def _append_spec_column(self, sig: str, power: np.ndarray, timestamp: float) -> None:
         if sig not in self._spec_data:
