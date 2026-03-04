@@ -957,18 +957,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._hr1_toggle = QtWidgets.QCheckBox("HR1")
         self._hr2_toggle = QtWidgets.QCheckBox("HR2")
         self._mhr_toggle = QtWidgets.QCheckBox("MHR")
-        self._toco_toggle = QtWidgets.QCheckBox("TOCO")
         self._spo2_toggle = QtWidgets.QCheckBox("SpO2")
         self._hr1_toggle.setChecked(self._settings.value("show_hr1", True, type=bool))
         self._hr2_toggle.setChecked(self._settings.value("show_hr2", True, type=bool))
         self._mhr_toggle.setChecked(self._settings.value("show_mhr", True, type=bool))
-        self._toco_toggle.setChecked(self._settings.value("show_toco", True, type=bool))
         self._spo2_toggle.setChecked(self._settings.value("show_spo2", True, type=bool))
         # Use lambdas so the attribute lookup happens at emit time.
         self._hr1_toggle.toggled.connect(lambda _checked=False: self._update_visibility_wrapper())
         self._hr2_toggle.toggled.connect(lambda _checked=False: self._update_visibility_wrapper())
         self._mhr_toggle.toggled.connect(lambda _checked=False: self._update_visibility_wrapper())
-        self._toco_toggle.toggled.connect(lambda _checked=False: self._update_visibility_wrapper())
         self._spo2_toggle.toggled.connect(lambda _checked=False: self._update_visibility_wrapper())
 
         self._tabs = QtWidgets.QTabWidget()
@@ -989,7 +986,6 @@ class MainWindow(QtWidgets.QMainWindow):
         toggles.addWidget(self._hr1_toggle)
         toggles.addWidget(self._hr2_toggle)
         toggles.addWidget(self._mhr_toggle)
-        toggles.addWidget(self._toco_toggle)
         toggles.addWidget(self._spo2_toggle)
         toggles.addStretch(1)
 
@@ -1582,6 +1578,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self._connect_button.setText("Connect")
             self._connect_button.setEnabled(True)
             self._connected = False
+            if self._worker or self._thread:
+                try:
+                    if self._worker:
+                        self._worker.stop()
+                    if self._thread:
+                        self._thread.quit()
+                        self._thread.wait(1000)
+                finally:
+                    self._worker = None
+                    self._thread = None
+                    if self._data_source == "remote":
+                        self._data_source = None
         elif lower.startswith("connecting"):
             # Neutral state while connecting.
             self._status_label.setStyleSheet("")
@@ -1835,11 +1843,9 @@ class MainWindow(QtWidgets.QMainWindow):
             line.set_visible(sig in active)
         self._spo2_line.set_visible(self._spo2_toggle.isChecked())
         self._spo2_ax.set_visible(self._spo2_toggle.isChecked())
-        self._toco_line.set_visible(self._toco_toggle.isChecked())
         self._settings.setValue("show_hr1", self._hr1_toggle.isChecked())
         self._settings.setValue("show_hr2", self._hr2_toggle.isChecked())
         self._settings.setValue("show_mhr", self._mhr_toggle.isChecked())
-        self._settings.setValue("show_toco", self._toco_toggle.isChecked())
         self._settings.setValue("show_spo2", self._spo2_toggle.isChecked())
         self._time_plot.canvas.draw_idle()
         self._toco_plot.canvas.draw_idle()
