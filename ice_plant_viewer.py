@@ -2,6 +2,7 @@ import os
 import sys
 import glob
 import platform
+import re
 from typing import Callable
 
 try:
@@ -36,6 +37,11 @@ MAX_SPEC_WINDOW_SECONDS = 300
 REFRESH_SECONDS = 0.5
 DEFAULT_SPEC_WINDOW_SECONDS = 16
 APP_VERSION = "0.1.0"
+
+ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+ANSI_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+ANSI_SS3_RE = re.compile(r"\x1bO.")
+ANSI_ESC_RE = re.compile(r"\x1b[@-_]")
 
 
 def decode_hr_sample(hi: int, lo: int) -> Optional[float]:
@@ -107,6 +113,44 @@ def parse_payload_line(line: str) -> Optional[Tuple[float, List[int]]]:
     if not values or values[0] not in (0x43, 0x53):
         return None
     return ts, values
+
+
+def sanitize_terminal_text(text: str) -> str:
+    if not text:
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\x1b[?2004h", "").replace("\x1b[?2004l", "")
+    text = ANSI_OSC_RE.sub("", text)
+    text = ANSI_CSI_RE.sub("", text)
+    text = ANSI_SS3_RE.sub("", text)
+    text = ANSI_ESC_RE.sub("", text)
+
+    cleaned: List[str] = []
+    for ch in text:
+        if ch == "\b":
+            if cleaned:
+                cleaned.pop()
+            continue
+        if ch == "\x7f":
+            continue
+        if ord(ch) < 32 and ch not in ("\n", "\t"):
+            continue
+        cleaned.append(ch)
+    return "".join(cleaned)
+
+
+def normalize_serial_terminal_command(text: str) -> str:
+    command = text.strip()
+    if not command:
+        return text
+    if command.startswith("systemctl "):
+        normalized = command
+        if "--no-pager" not in normalized:
+            normalized += " --no-pager"
+        if "--plain" not in normalized:
+            normalized += " --plain"
+        return f"SYSTEMD_PAGER=cat SYSTEMD_COLORS=0 TERM=dumb {normalized}"
+    return text
 
 
 def ssh_cmd(host: str, remote_cmd: str) -> List[str]:
@@ -749,6 +793,57 @@ class SerialTailWorker(QtCore.QObject):
             pass
 
 
+class SerialTerminalInput(QtWidgets.QLineEdit):
+    submitted = QtCore.Signal(str)
+    raw_input = QtCore.Signal(str)
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        modifiers = event.modifiers()
+        key = event.key()
+
+        if key in (QtCore.Qt.Key.Key_Return, QtCore.Qt.Key.Key_Enter):
+            if self.text():
+                self.submitted.emit(self.text())
+            else:
+                self.raw_input.emit("\n")
+            self.clear()
+            return
+        if key == QtCore.Qt.Key.Key_Escape:
+            self.raw_input.emit("\x1b")
+            return
+        if key == QtCore.Qt.Key.Key_Tab:
+            self.raw_input.emit("\t")
+            return
+        if modifiers & QtCore.Qt.KeyboardModifier.ControlModifier:
+            control_map = {
+                QtCore.Qt.Key.Key_C: "\x03",
+                QtCore.Qt.Key.Key_D: "\x04",
+                QtCore.Qt.Key.Key_Z: "\x1a",
+            }
+            sequence = control_map.get(key)
+            if sequence is not None:
+                self.raw_input.emit(sequence)
+                self.clear()
+                return
+        if key == QtCore.Qt.Key.Key_Backspace and not self.text():
+            self.raw_input.emit("\x7f")
+            return
+        arrow_map = {
+            QtCore.Qt.Key.Key_Up: "\x1b[A",
+            QtCore.Qt.Key.Key_Down: "\x1b[B",
+            QtCore.Qt.Key.Key_Right: "\x1b[C",
+            QtCore.Qt.Key.Key_Left: "\x1b[D",
+            QtCore.Qt.Key.Key_Home: "\x1b[H",
+            QtCore.Qt.Key.Key_End: "\x1b[F",
+            QtCore.Qt.Key.Key_Delete: "\x1b[3~",
+        }
+        sequence = arrow_map.get(key)
+        if sequence is not None:
+            self.raw_input.emit(sequence)
+            return
+        super().keyPressEvent(event)
+
+
 class SerialTerminalDialog(QtWidgets.QDialog):
     def __init__(self, port: str, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -761,10 +856,11 @@ class SerialTerminalDialog(QtWidgets.QDialog):
 
         self._output = QtWidgets.QPlainTextEdit()
         self._output.setReadOnly(True)
-        self._input = QtWidgets.QLineEdit()
+        self._input = SerialTerminalInput()
         self._input.setPlaceholderText("Type command and press Enter")
 
-        self._input.returnPressed.connect(self._send_input)
+        self._input.submitted.connect(self._send_input)
+        self._input.raw_input.connect(self._send_raw_input)
 
         controls = QtWidgets.QHBoxLayout()
         controls.addWidget(self._input, 1)
@@ -782,8 +878,9 @@ class SerialTerminalDialog(QtWidgets.QDialog):
     def _append(self, text: str) -> None:
         if not text:
             return
-        # Filter bracketed-paste control sequences for a cleaner display.
-        text = text.replace("\x1b[?2004h", "").replace("\x1b[?2004l", "")
+        text = sanitize_terminal_text(text)
+        if not text:
+            return
         self._output.moveCursor(QtGui.QTextCursor.End)
         self._output.insertPlainText(text)
         self._output.moveCursor(QtGui.QTextCursor.End)
@@ -827,12 +924,16 @@ class SerialTerminalDialog(QtWidgets.QDialog):
         self._thread = None
         self._worker = None
 
-    def _send_input(self) -> None:
-        text = self._input.text()
-        if not text or not self._worker:
+    def _send_input(self, text: str) -> None:
+        if not self._worker:
             return
-        self._worker.send(text + "\n")
-        self._input.clear()
+        if text:
+            self._worker.send(normalize_serial_terminal_command(text) + "\n")
+
+    def _send_raw_input(self, text: str) -> None:
+        if not self._worker:
+            return
+        self._worker.send(text)
 
 class FileCheckWorker(QtCore.QObject):
     result = QtCore.Signal(object)
