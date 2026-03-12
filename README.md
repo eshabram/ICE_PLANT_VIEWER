@@ -49,6 +49,30 @@ bash scripts/release_macos.sh --version 0.2.0
 Manual build/install steps are documented in `scripts/build_macos.sh` and `scripts/release_macos.sh`.
 The macOS menu bar app name comes from the bundle; the `.app` name here is what will display.
 
+## Windows Build And Release
+Build the Windows app from Git Bash, MSYS2, or another bash environment on a Windows machine:
+```bash
+bash scripts/build_windows.sh
+```
+
+Create Windows release artifacts from bash on Windows:
+```bash
+bash scripts/release_windows.sh
+```
+
+Options:
+- `--no-bump` to keep the current version
+- `--version X.Y.Z` to set an explicit version
+
+Release output:
+- Always creates `dist/releases/Ice-Plant-Viewer-X.Y.Z-windows.zip`
+- Also creates `dist/releases/Ice-Plant-Viewer-X.Y.Z-setup.exe` when Inno Setup 6 is installed
+
+Windows prerequisites:
+- Run the scripts on Windows; PyInstaller does not cross-compile from macOS/Linux
+- `pyinstaller` available in the active environment
+- Optional: Inno Setup 6 installed for the `.exe` installer (`ISCC.exe`)
+
 ## Versioning
 We use semantic versioning: `MAJOR.MINOR.PATCH`.
 - Increment `MAJOR` for breaking changes

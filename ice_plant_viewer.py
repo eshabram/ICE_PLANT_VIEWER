@@ -153,6 +153,12 @@ def normalize_serial_terminal_command(text: str) -> str:
     return text
 
 
+def control_character_for_key(key: int) -> Optional[str]:
+    if QtCore.Qt.Key.Key_A <= key <= QtCore.Qt.Key.Key_Z:
+        return chr(key - QtCore.Qt.Key.Key_A + 1)
+    return None
+
+
 def ssh_cmd(host: str, remote_cmd: str) -> List[str]:
     return [
         "ssh",
@@ -162,6 +168,10 @@ def ssh_cmd(host: str, remote_cmd: str) -> List[str]:
         "ServerAliveInterval=2",
         "-o",
         "ServerAliveCountMax=2",
+        # Accept first-use host keys without an interactive prompt, but still
+        # fail if a known host key changes.
+        "-o",
+        "StrictHostKeyChecking=accept-new",
         host,
         remote_cmd,
     ]
@@ -455,6 +465,7 @@ class SerialWorker(QtCore.QObject):
         self._baud = baud
         self._stop = False
         self._ser = None
+        self._closed = False
 
     @QtCore.Slot()
     def run(self) -> None:
@@ -540,6 +551,7 @@ class SerialWorker(QtCore.QObject):
                     self.status.emit(f"Serial: Disconnected: {exc}")
                     break
         finally:
+            self._closed = True
             try:
                 if self._ser:
                     self._ser.close()
@@ -560,6 +572,8 @@ class SerialWorker(QtCore.QObject):
     @QtCore.Slot()
     def stop(self) -> None:
         self._stop = True
+        if self._closed:
+            return
         try:
             if self._ser:
                 self._ser.write(b"\x03")
@@ -607,6 +621,7 @@ class SerialTailWorker(QtCore.QObject):
         self._sent_user = False
         self._sent_pass = False
         self._suppress_disconnect = False
+        self._closed = False
 
     @QtCore.Slot()
     def run(self) -> None:
@@ -754,11 +769,13 @@ class SerialTailWorker(QtCore.QObject):
                 else:
                     continue
         finally:
+            self._closed = True
             try:
                 if self._ser:
                     self._ser.close()
             except Exception:
                 pass
+            self._ser = None
             self.stopped.emit()
 
     def _write(self, text: str) -> None:
@@ -773,6 +790,8 @@ class SerialTailWorker(QtCore.QObject):
     def stop(self) -> None:
         self._stop = True
         self._suppress_disconnect = True
+        if self._closed:
+            return
         # Attempt to return to login prompt to allow immediate reconnects.
         try:
             if self._ser:
@@ -797,6 +816,27 @@ class SerialTerminalInput(QtWidgets.QLineEdit):
     submitted = QtCore.Signal(str)
     raw_input = QtCore.Signal(str)
 
+    def _handle_control_event(self, event: QtGui.QKeyEvent) -> bool:
+        if not (event.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier):
+            return False
+        sequence = control_character_for_key(event.key())
+        if sequence is None:
+            return False
+        if event.type() == QtCore.QEvent.Type.KeyPress:
+            self.raw_input.emit(sequence)
+            self.clear()
+        event.accept()
+        return True
+
+    def event(self, event: QtCore.QEvent) -> bool:
+        if isinstance(event, QtGui.QKeyEvent) and event.type() in (
+            QtCore.QEvent.Type.ShortcutOverride,
+            QtCore.QEvent.Type.KeyPress,
+        ):
+            if self._handle_control_event(event):
+                return True
+        return super().event(event)
+
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
         modifiers = event.modifiers()
         key = event.key()
@@ -814,17 +854,6 @@ class SerialTerminalInput(QtWidgets.QLineEdit):
         if key == QtCore.Qt.Key.Key_Tab:
             self.raw_input.emit("\t")
             return
-        if modifiers & QtCore.Qt.KeyboardModifier.ControlModifier:
-            control_map = {
-                QtCore.Qt.Key.Key_C: "\x03",
-                QtCore.Qt.Key.Key_D: "\x04",
-                QtCore.Qt.Key.Key_Z: "\x1a",
-            }
-            sequence = control_map.get(key)
-            if sequence is not None:
-                self.raw_input.emit(sequence)
-                self.clear()
-                return
         if key == QtCore.Qt.Key.Key_Backspace and not self.text():
             self.raw_input.emit("\x7f")
             return
@@ -856,6 +885,7 @@ class SerialTerminalDialog(QtWidgets.QDialog):
 
         self._output = QtWidgets.QPlainTextEdit()
         self._output.setReadOnly(True)
+        self._output.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
         self._input = SerialTerminalInput()
         self._input.setPlaceholderText("Type command and press Enter")
 
@@ -870,10 +900,32 @@ class SerialTerminalDialog(QtWidgets.QDialog):
         layout.addLayout(controls)
 
         self._connect()
+        self._input.setFocus()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[name-defined]
         self._disconnect()
         super().closeEvent(event)
+
+    def _handle_control_event(self, event: QtGui.QKeyEvent) -> bool:
+        if not (event.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier):
+            return False
+        sequence = control_character_for_key(event.key())
+        if sequence is None:
+            return False
+        if event.type() == QtCore.QEvent.Type.KeyPress:
+            self._send_raw_input(sequence)
+            self._input.setFocus()
+        event.accept()
+        return True
+
+    def event(self, event: QtCore.QEvent) -> bool:
+        if isinstance(event, QtGui.QKeyEvent) and event.type() in (
+            QtCore.QEvent.Type.ShortcutOverride,
+            QtCore.QEvent.Type.KeyPress,
+        ):
+            if self._handle_control_event(event):
+                return True
+        return super().event(event)
 
     def _append(self, text: str) -> None:
         if not text:
@@ -909,7 +961,11 @@ class SerialTerminalDialog(QtWidgets.QDialog):
                 time.sleep(0.2)
             except Exception:
                 pass
-            self._worker.stop()
+            QtCore.QMetaObject.invokeMethod(
+                self._worker,
+                "stop",
+                QtCore.Qt.ConnectionType.QueuedConnection,
+            )
         if self._thread:
             self._thread.quit()
             self._thread.wait(1000)
@@ -1476,9 +1532,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._serial_worker.stopped.connect(self._on_serial_stopped)
         self._serial_thread.start()
 
-    def _stop_serial_stream(self, reason: Optional[str] = None) -> None:
-        if self._serial_worker:
-            self._serial_worker.stop()
+    def _stop_serial_stream(self, reason: Optional[str] = None, request_stop: bool = True) -> None:
+        if self._serial_worker and request_stop:
+            QtCore.QMetaObject.invokeMethod(
+                self._serial_worker,
+                "stop",
+                QtCore.Qt.ConnectionType.QueuedConnection,
+            )
         if self._serial_thread:
             self._serial_thread.quit()
             self._serial_thread.wait(1000)
@@ -1492,7 +1552,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._on_status(reason)
 
     def _on_serial_stopped(self) -> None:
-        self._stop_serial_stream()
+        self._stop_serial_stream(request_stop=False)
 
     def _auto_connect_if_enabled(self) -> None:
         if self._connected or self._static_view:
