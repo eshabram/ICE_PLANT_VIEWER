@@ -21,6 +21,15 @@ Options:
 EOF
 }
 
+to_windows_path() {
+  local path="$1"
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "$path"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
 case "${OS:-}" in
   Windows_NT) ;;
   *)
@@ -142,11 +151,15 @@ if [[ -z "$ISCC_BIN" ]]; then
 fi
 
 if [[ -n "$ISCC_BIN" ]]; then
-  "$ISCC_BIN" \
+  INSTALLER_SCRIPT_WIN="$(to_windows_path "$INSTALLER_SCRIPT")"
+  DIST_DIR_WIN="$(to_windows_path "$DIST_DIR")"
+  RELEASE_DIR_WIN="$(to_windows_path "$RELEASE_DIR")"
+
+  MSYS2_ARG_CONV_EXCL='*' "$ISCC_BIN" \
     "/DMyAppVersion=${new_version}" \
-    "/DMyAppSourceDir=${DIST_DIR}" \
-    "/DMyAppOutputDir=${RELEASE_DIR}" \
-    "$INSTALLER_SCRIPT"
+    "/DMyAppSourceDir=${DIST_DIR_WIN}" \
+    "/DMyAppOutputDir=${RELEASE_DIR_WIN}" \
+    "$INSTALLER_SCRIPT_WIN"
   echo "Installer created: ${INSTALLER_PATH}"
 else
   echo "Inno Setup not found; skipping installer build and keeping ZIP artifact only."

@@ -1,6 +1,7 @@
 #define MyAppName "Ice Plant Viewer"
 #define MyAppPublisher "ICE_PLANT"
 #define MyAppExeName "Ice Plant Viewer.exe"
+#define MyAppIconFile AddBackslash(SourcePath) + "..\assets\ice_plant.ico"
 
 #ifndef MyAppVersion
   #define MyAppVersion "0.0.0"
@@ -30,6 +31,7 @@ WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\{#MyAppExeName}
+SetupIconFile={#MyAppIconFile}
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"

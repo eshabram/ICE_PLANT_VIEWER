@@ -51,6 +51,18 @@ ANSI_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 ANSI_SS3_RE = re.compile(r"\x1bO.")
 ANSI_ESC_RE = re.compile(r"\x1b[@-_]")
 
+WINDOWS_SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+
+def run_subprocess(*args, **kwargs):
+    kwargs.setdefault("creationflags", WINDOWS_SUBPROCESS_FLAGS)
+    return subprocess.run(*args, **kwargs)
+
+
+def popen_subprocess(*args, **kwargs):
+    kwargs.setdefault("creationflags", WINDOWS_SUBPROCESS_FLAGS)
+    return subprocess.Popen(*args, **kwargs)
+
 
 def decode_hr_sample(hi: int, lo: int) -> Optional[float]:
     value = ((hi & 0x07) << 8) | lo
@@ -256,14 +268,14 @@ def get_latest_remote_file(host: str, remote_dir: str) -> Optional[str]:
         f"ls -t {shlex.quote(remote_dir)}/ctg_frames_*.csv "
         f"{shlex.quote(remote_dir)}/ctg_frames_sim_*.csv 2>/dev/null | head -n1"
     )
-    proc = subprocess.run(ssh_cmd(host, cmd), capture_output=True, text=True, timeout=5)
+    proc = run_subprocess(ssh_cmd(host, cmd), capture_output=True, text=True, timeout=5)
     path = proc.stdout.strip()
     return path if path else None
 
 
 def read_remote_file(host: str, path: str) -> List[str]:
     cmd = f"cat {shlex.quote(path)}"
-    proc = subprocess.run(ssh_cmd(host, cmd), capture_output=True, text=True, timeout=10)
+    proc = run_subprocess(ssh_cmd(host, cmd), capture_output=True, text=True, timeout=10)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "Failed to read remote file.")
     return proc.stdout.splitlines()
@@ -316,7 +328,7 @@ class TailWorker(QtCore.QObject):
                 self.status.emit(f"Remote: Tailing {remote_path}")
                 if self._prefill_seconds > 0:
                     try:
-                        last_line_proc = subprocess.run(
+                        last_line_proc = run_subprocess(
                             ssh_cmd(self._host, f"tail -n 1 {shlex.quote(remote_path)}"),
                             capture_output=True,
                             text=True,
@@ -331,7 +343,7 @@ class TailWorker(QtCore.QObject):
                                 f"awk -F, 'NR>1 && $1+0>={cutoff:.6f} {{print}}' "
                                 f"{shlex.quote(remote_path)}"
                             )
-                            prefill_proc = subprocess.run(
+                            prefill_proc = run_subprocess(
                                 ssh_cmd(self._host, awk_cmd),
                                 capture_output=True,
                                 text=True,
@@ -350,7 +362,7 @@ class TailWorker(QtCore.QObject):
 
             cmd = f"tail -F -n 0 {shlex.quote(remote_path)}"
             try:
-                self._proc = subprocess.Popen(ssh_cmd(self._host, cmd), stdout=subprocess.PIPE, text=True)
+                self._proc = popen_subprocess(ssh_cmd(self._host, cmd), stdout=subprocess.PIPE, text=True)
             except Exception as exc:
                 self.status.emit(f"Remote: Disconnected: {exc}")
                 self.stopped.emit()
@@ -477,7 +489,7 @@ class DownloadWorker(QtCore.QObject):
             f"ls -1 {shlex.quote(self._remote_dir)}/ctg_frames_*.csv 2>/dev/null | "
             f"grep -v '_sim_'"
         )
-        proc = subprocess.run(ssh_cmd(self._host, list_cmd), capture_output=True, text=True)
+        proc = run_subprocess(ssh_cmd(self._host, list_cmd), capture_output=True, text=True)
         if proc.returncode != 0 or not proc.stdout.strip():
             self.status.emit("Remote: No CSV files found.")
             self.finished.emit()
@@ -488,7 +500,7 @@ class DownloadWorker(QtCore.QObject):
             f"cd {shlex.quote(self._remote_dir)} && "
             f"tar -czf - --exclude='*sim*' ctg_frames_*.csv"
         )
-        ssh_proc = subprocess.Popen(
+        ssh_proc = popen_subprocess(
             ssh_cmd(self._host, tar_cmd),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -498,7 +510,7 @@ class DownloadWorker(QtCore.QObject):
             self.finished.emit()
             return
 
-        tar_proc = subprocess.Popen(
+        tar_proc = popen_subprocess(
             ["tar", "-xzf", "-", "-C", self._dest_dir],
             stdin=ssh_proc.stdout,
             stdout=subprocess.PIPE,
