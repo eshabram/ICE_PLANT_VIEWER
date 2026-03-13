@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+
+  build-macos:
+    runs-on: macos-latest
+    needs: create-release
+    env:
+      RELEASE_VERSION: ${{ github.ref_name }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install create-dmg
+        run: brew install create-dmg
+
+      - name: Build macOS release artifacts
+        shell: bash
+        run: |
+          VERSION="${RELEASE_VERSION#v}"
+          bash scripts/release_macos.sh --version "${VERSION}"
+
+      - name: Upload macOS artifacts to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Ice-Plant-Viewer-*.dmg
+
+  build-windows:
+    runs-on: windows-latest
+    needs: create-release
+    env:
+      RELEASE_VERSION: ${{ github.ref_name }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        shell: bash
+        run: pip install -r requirements.txt
+
+      - name: Install Inno Setup
+        shell: powershell
+        run: choco install innosetup --no-progress -y
+
+      - name: Build Windows release artifacts
+        shell: bash
+        run: |
+          VERSION="${RELEASE_VERSION#v}"
+          bash scripts/release_windows.sh --version "${VERSION}"
+
+      - name: Upload Windows artifacts to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/releases/Ice-Plant-Viewer-*-windows.zip
+            dist/releases/Ice-Plant-Viewer-*-setup.exe
+          fail_on_unmatched_files: false

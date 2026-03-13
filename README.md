@@ -28,8 +28,16 @@ Unused DB9 pins (1, 4, 6, 9) are left unconnected.
 
 The DB9 male connector plugs directly into the MAX3232 board, which performs RS-232 to 3.3V TTL conversion. The TTL side of the MAX3232 connects to the Raspberry Pi UART (GPIO14/TXD0, GPIO15/RXD0, 3.3V, and GND).
 
-## MacOS Release (App + DMG)
-Preferred path (automated, uses create-dmg):
+## MacOS Build And Release
+Build the macOS app bundle only:
+```bash
+bash scripts/build_macos.sh
+```
+
+Create a full macOS release:
+- builds `dist/Ice Plant Viewer.app`
+- then creates a versioned `.dmg`
+
 ```bash
 bash scripts/release_macos.sh
 ```
@@ -46,7 +54,10 @@ bash scripts/release_macos.sh --no-bump
 bash scripts/release_macos.sh --version 0.2.0
 ```
 
-Manual build/install steps are documented in `scripts/build_macos.sh` and `scripts/release_macos.sh`.
+Script split:
+- `scripts/build_macos.sh`: builds the `.app` only
+- `scripts/release_macos.sh`: builds the `.app` and packages the `.dmg`
+
 The macOS menu bar app name comes from the bundle; the `.app` name here is what will display.
 
 ## Windows Build And Release
@@ -56,6 +67,9 @@ bash scripts/build_windows.sh
 ```
 
 Create Windows release artifacts from bash on Windows:
+- builds `dist/Ice Plant Viewer/`
+- then packages release artifacts
+
 ```bash
 bash scripts/release_windows.sh
 ```
@@ -68,6 +82,10 @@ Release output:
 - Always creates `dist/releases/Ice-Plant-Viewer-X.Y.Z-windows.zip`
 - Also creates `dist/releases/Ice-Plant-Viewer-X.Y.Z-setup.exe` when Inno Setup 6 is installed
 
+Script split:
+- `scripts/build_windows.sh`: builds the app directory only
+- `scripts/release_windows.sh`: builds the app directory and packages the ZIP, plus the `.exe` installer when Inno Setup is available
+
 Windows prerequisites:
 - Run the scripts on Windows; PyInstaller does not cross-compile from macOS/Linux
 - `pyinstaller` available in the active environment
@@ -78,3 +96,17 @@ We use semantic versioning: `MAJOR.MINOR.PATCH`.
 - Increment `MAJOR` for breaking changes
 - Increment `MINOR` for new features
 - Increment `PATCH` for fixes and small changes
+
+## GitHub Releases
+Pushing a git tag like `v0.2.0` triggers the GitHub Actions release workflow in [`.github/workflows/release.yml`](/Users/elliotshabram/repos/ICE_PLANT_VIEWER/.github/workflows/release.yml).
+
+That workflow:
+- creates or updates the GitHub Release for the tag
+- builds the macOS release and uploads the `.dmg`
+- builds the Windows release and uploads the ZIP and, when available, the `.exe` installer
+
+Example:
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
