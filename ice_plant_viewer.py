@@ -37,6 +37,13 @@ MAX_SPEC_WINDOW_SECONDS = 300
 REFRESH_SECONDS = 0.5
 DEFAULT_SPEC_WINDOW_SECONDS = 16
 APP_VERSION = "0.1.0"
+VALID_BLOCK_TYPES = {"C", "I", "P", "T", "S", "F", "N", "MM"}
+SUMMARY_STALE_SECONDS = {
+    "mspo2": 60.0,
+    "mpr": 60.0,
+    "nibp": 180.0,
+    "temp": 300.0,
+}
 
 ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 ANSI_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
@@ -61,40 +68,44 @@ def decode_hr_samples(payload: List[int], start_index: int) -> List[Optional[flo
 
 
 def decode_hr1_samples(payload: List[int]) -> List[Optional[float]]:
-    return decode_hr_samples(payload, 3)
+    return decode_hr_samples(payload, 2)
 
 
 def decode_hr2_samples(payload: List[int]) -> List[Optional[float]]:
-    return decode_hr_samples(payload, 11)
+    return decode_hr_samples(payload, 10)
 
 
 def decode_mhr_samples(payload: List[int]) -> List[Optional[float]]:
-    return decode_hr_samples(payload, 19)
+    return decode_hr_samples(payload, 18)
 
 
 def decode_toco_samples(payload: List[int]) -> List[Optional[float]]:
-    if len(payload) < 31:
+    if len(payload) < 30:
         return []
     samples = []
-    for i in range(27, 31):
+    for i in range(26, 30):
         value = payload[i]
         samples.append(value * 0.5)
     return samples
 
 
-def parse_payload_line(line: str) -> Optional[Tuple[float, List[int]]]:
-    row = line.strip().split(",", 2)
-    if len(row) < 3 or row[0] == "timestamp":
-        return None
-    try:
-        ts = float(row[0])
-    except ValueError:
-        return None
-    try:
-        payload_len = int(row[1])
-    except ValueError:
-        payload_len = 0
-    parts = row[2].strip().split()
+def decode_s_block_measurements(payload: List[int]) -> Tuple[Optional[float], Optional[float]]:
+    values = payload
+    if len(values) >= 4 and values[0] == 0x53:
+        values = values[1:]
+    if len(values) < 3:
+        return None, None
+
+    spo2_raw = values[0]
+    pulse_raw = (values[1] << 8) | values[2]
+
+    spo2 = None if spo2_raw == 0 else (spo2_raw / 2.0)
+    pulse = None if pulse_raw == 0 else (pulse_raw / 4.0)
+    return spo2, pulse
+
+
+def parse_payload_hex(payload_text: str, payload_len: int = 0) -> Optional[List[int]]:
+    parts = payload_text.strip().split()
     values: List[int] = []
     for p in parts:
         token = p.strip()
@@ -110,9 +121,53 @@ def parse_payload_line(line: str) -> Optional[Tuple[float, List[int]]]:
         if len(values) < payload_len:
             return None
         values = values[:payload_len]
-    if not values or values[0] not in (0x43, 0x53):
+    return values
+
+
+def normalize_block_payload(block_type: str, values: List[int]) -> List[int]:
+    if not values:
+        return values
+    if block_type == "MM":
+        if len(values) >= 2 and values[0] == 0x4D and values[1] == 0x4D:
+            return values[2:]
+        return values
+    if len(block_type) == 1 and values[0] == ord(block_type):
+        return values[1:]
+    return values
+
+
+def parse_payload_line(line: str) -> Optional[Tuple[float, str, List[int]]]:
+    row = line.strip().split(",", 3)
+    if len(row) < 3 or row[0] == "timestamp":
         return None
-    return ts, values
+    try:
+        ts = float(row[0])
+    except ValueError:
+        return None
+    if len(row) >= 4 and row[1] in VALID_BLOCK_TYPES:
+        block_type = row[1]
+        try:
+            payload_len = int(row[2])
+        except ValueError:
+            payload_len = 0
+        values = parse_payload_hex(row[3], payload_len)
+        if values is None:
+            return None
+        return ts, block_type, normalize_block_payload(block_type, values)
+
+    try:
+        payload_len = int(row[1])
+    except ValueError:
+        return None
+    values = parse_payload_hex(row[2], payload_len)
+    if values is None or not values:
+        return None
+    lead = values[0]
+    if lead == 0x4D and len(values) > 1 and values[1] == 0x4D:
+        return ts, "MM", values[2:]
+    if lead not in (0x43, 0x49, 0x50, 0x54, 0x53, 0x46, 0x4E):
+        return None
+    return ts, chr(lead), values[1:]
 
 
 def sanitize_terminal_text(text: str) -> str:
@@ -251,7 +306,7 @@ class TailWorker(QtCore.QObject):
                         last_line = last_line_proc.stdout.strip()
                         last_parsed = parse_payload_line(last_line) if last_line else None
                         if last_parsed is not None:
-                            latest_ts, _ = last_parsed
+                            latest_ts, _, _ = last_parsed
                             cutoff = latest_ts - float(self._prefill_seconds)
                             awk_cmd = (
                                 f"awk -F, 'NR>1 && $1+0>={cutoff:.6f} {{print}}' "
@@ -1059,6 +1114,90 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_visibility_wrapper(self, _checked: bool = False) -> None:
         self._update_visibility()
 
+    def _create_summary_card(self, key: str, title: str) -> QtWidgets.QFrame:
+        frame = QtWidgets.QFrame()
+        frame.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
+        frame.setMinimumWidth(110)
+
+        title_label = QtWidgets.QLabel(title)
+        value_label = QtWidgets.QLabel("--")
+        value_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        title_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+
+        title_font = title_label.font()
+        title_font.setPointSize(max(8, title_font.pointSize() - 1))
+        title_label.setFont(title_font)
+
+        value_font = value_label.font()
+        value_font.setPointSize(max(12, value_font.pointSize() + 3))
+        value_font.setBold(True)
+        value_label.setFont(value_font)
+
+        card_layout = QtWidgets.QVBoxLayout(frame)
+        card_layout.setContentsMargins(10, 8, 10, 8)
+        card_layout.addWidget(title_label)
+        card_layout.addWidget(value_label)
+
+        self._summary_titles[key] = title_label
+        self._summary_labels[key] = value_label
+        self._summary_frames[key] = frame
+        return frame
+
+    def _set_summary_value(self, key: str, value: Optional[str]) -> None:
+        if key not in self._summary_state:
+            return
+        self._summary_state[key]["value"] = value
+        self._summary_state[key]["received_at"] = time.time() if value is not None else None
+        self._refresh_summary_cards()
+
+    def _refresh_summary_cards(self) -> None:
+        now = time.time()
+        if self._theme_override == "light":
+            fresh_title = "#555555"
+            fresh_value = "#111111"
+            stale_title = "#a0a0a0"
+            stale_value = "#8f8f8f"
+            frame_border = "#d0d0d0"
+            frame_bg = "#ffffff"
+        else:
+            fresh_title = "#b8b8b8"
+            fresh_value = "#f0f0f0"
+            stale_title = "#6f6f6f"
+            stale_value = "#7d7d7d"
+            frame_border = "#4d4d4d"
+            frame_bg = "#232323"
+        for key, state in self._summary_state.items():
+            value = state.get("value")
+            received_at = state.get("received_at")
+            is_stale = (
+                not self._static_view
+                and value is not None
+                and isinstance(received_at, (int, float))
+                and (now - float(received_at)) > SUMMARY_STALE_SECONDS[key]
+            )
+            label = self._summary_labels.get(key)
+            title = self._summary_titles.get(key)
+            frame = self._summary_frames.get(key)
+            if label is not None:
+                label.setText(str(value) if value is not None else "--")
+                label.setStyleSheet(f"color: {stale_value if is_stale else fresh_value};")
+            if title is not None:
+                title.setStyleSheet(f"color: {stale_title if is_stale else fresh_title};")
+            if frame is not None:
+                frame.setStyleSheet(
+                    f"QFrame {{ border: 1px solid {frame_border}; border-radius: 6px; background: {frame_bg}; }}"
+                )
+
+    def _clear_summary_values(self) -> None:
+        for key in self._summary_state:
+            self._summary_state[key]["value"] = None
+            self._summary_state[key]["received_at"] = None
+        self._refresh_summary_cards()
+
+    def _on_refresh_timer(self) -> None:
+        self._refresh_summary_cards()
+        self._refresh_plots()
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(f"Ice Plant Viewer v{APP_VERSION}")
@@ -1086,6 +1225,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._status_label.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred
         )
+        self._summary_labels: Dict[str, QtWidgets.QLabel] = {}
+        self._summary_titles: Dict[str, QtWidgets.QLabel] = {}
+        self._summary_frames: Dict[str, QtWidgets.QFrame] = {}
+        self._summary_state: Dict[str, Dict[str, Optional[object]]] = {
+            "mspo2": {"value": None, "received_at": None},
+            "mpr": {"value": None, "received_at": None},
+            "nibp": {"value": None, "received_at": None},
+            "temp": {"value": None, "received_at": None},
+        }
 
         self._build_menu()
 
@@ -1114,7 +1262,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._hr1_toggle = QtWidgets.QCheckBox("HR1")
         self._hr2_toggle = QtWidgets.QCheckBox("HR2")
         self._mhr_toggle = QtWidgets.QCheckBox("MHR")
-        self._spo2_toggle = QtWidgets.QCheckBox("SpO2")
+        self._spo2_toggle = QtWidgets.QCheckBox("FSpO2")
         self._hr1_toggle.setChecked(self._settings.value("show_hr1", True, type=bool))
         self._hr2_toggle.setChecked(self._settings.value("show_hr2", True, type=bool))
         self._mhr_toggle.setChecked(self._settings.value("show_mhr", True, type=bool))
@@ -1146,9 +1294,18 @@ class MainWindow(QtWidgets.QMainWindow):
         toggles.addWidget(self._spo2_toggle)
         toggles.addStretch(1)
 
+        summary_layout = QtWidgets.QHBoxLayout()
+        summary_layout.setSpacing(10)
+        summary_layout.addWidget(self._create_summary_card("mspo2", "MSpO2"))
+        summary_layout.addWidget(self._create_summary_card("mpr", "MPR"))
+        summary_layout.addWidget(self._create_summary_card("nibp", "NIBP"))
+        summary_layout.addWidget(self._create_summary_card("temp", "Temp"))
+        summary_layout.addStretch(1)
+
         container = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(container)
         layout.addLayout(top_controls)
+        layout.addLayout(summary_layout)
         layout.addLayout(toggles)
         layout.addWidget(self._tabs)
 
@@ -1186,14 +1343,14 @@ class MainWindow(QtWidgets.QMainWindow):
             "hr2": deque(),
             "mhr": deque(),
             "toco": deque(),
-            "spo2": deque(),
+            "fspo2": deque(),
         }
         self._values: Dict[str, Deque[float]] = {
             "hr1": deque(),
             "hr2": deque(),
             "mhr": deque(),
             "toco": deque(),
-            "spo2": deque(),
+            "fspo2": deque(),
         }
 
         self._spec_plots = {}
@@ -1215,8 +1372,8 @@ class MainWindow(QtWidgets.QMainWindow):
         }
 
         self._spo2_ax = self._time_plot.ax.twinx()
-        self._spo2_ax.set_ylabel("SpO2")
-        self._spo2_line = self._spo2_ax.plot([], [], lw=1, color="tab:red", label="SpO2")[0]
+        self._spo2_ax.set_ylabel("FSpO2")
+        self._fspo2_line = self._spo2_ax.plot([], [], lw=1, color="tab:red", label="FSpO2")[0]
         self._time_plot.ax.legend(loc="upper left")
         self._spo2_ax.legend(loc="upper right")
         self._toco_line = self._toco_plot.ax.plot([], [], lw=1.5, color="#8b5a2b", label="TOCO")[0]
@@ -1225,11 +1382,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(int(REFRESH_SECONDS * 1000))
-        self._timer.timeout.connect(self._refresh_plots)
+        self._timer.timeout.connect(self._on_refresh_timer)
         self._timer.start()
 
         self._set_theme_mode(self._theme_mode)
         self._update_visibility()
+        self._refresh_summary_cards()
         QtCore.QTimer.singleShot(0, self._auto_connect_if_enabled)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[name-defined]
@@ -1319,6 +1477,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._connected = False
         self._data_source = None
         self._connect_button.setText("Connect")
+        self._clear_summary_values()
         self._on_status("Disconnected")
         self._load_button.setEnabled(True)
 
@@ -1331,6 +1490,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._connected = False
         self._data_source = None
         self._connect_button.setText("Connect")
+        self._clear_summary_values()
         self._on_status("Disconnected")
         self._load_button.setEnabled(True)
         self._suppress_spec_rows = False
@@ -1735,6 +1895,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_status_label()
         lower = message.lower()
         if "disconnected" in lower:
+            self._clear_summary_values()
             self._status_label.setStyleSheet("color: #d32f2f;")
             self._connect_button.setText("Connect")
             self._connect_button.setEnabled(True)
@@ -1827,17 +1988,29 @@ class MainWindow(QtWidgets.QMainWindow):
         parsed = parse_payload_line(line)
         if parsed is None:
             return
-        ts, payload = parsed
+        ts, block_type, payload = parsed
+        if block_type == "S":
+            spo2, pulse = decode_s_block_measurements(payload)
+            if spo2 is not None:
+                self._set_summary_value("mspo2", f"{spo2:.1f}%")
+            if pulse is not None:
+                self._set_summary_value("mpr", f"{pulse:.1f} bpm")
+            return
+        if block_type in {"P", "T", "I", "F", "N", "MM"}:
+            return
+        if block_type != "C":
+            return
+
         if self._last_packet_ts is not None and ts < (self._last_packet_ts - 0.5):
             # Timestamps moved backwards; treat as a fresh stream to avoid visual shifts.
             self._reset_live_buffers()
-        if len(payload) > 34:
-            spo2 = payload[34]
+        if len(payload) > 33:
+            spo2 = payload[33]
             if spo2 != 0:
                 for i in range(PACKET_SAMPLES):
                     t = ts - (3 - i) * 0.25
-                    self._times["spo2"].append(t)
-                    self._values["spo2"].append(float(spo2))
+                    self._times["fspo2"].append(t)
+                    self._values["fspo2"].append(float(spo2))
         for sig, decoder in self._signal_map.items():
             samples = decoder(payload)
             if not samples:
@@ -1862,9 +2035,9 @@ class MainWindow(QtWidgets.QMainWindow):
             while self._times[sig] and (latest_time - self._times[sig][0]) > history_seconds:
                 self._times[sig].popleft()
                 self._values[sig].popleft()
-        while self._times["spo2"] and (latest_time - self._times["spo2"][0]) > history_seconds:
-            self._times["spo2"].popleft()
-            self._values["spo2"].popleft()
+        while self._times["fspo2"] and (latest_time - self._times["fspo2"][0]) > history_seconds:
+            self._times["fspo2"].popleft()
+            self._values["fspo2"].popleft()
 
     def _on_line_with_source(self, line: str, source: str) -> None:
         if self._data_source and self._data_source != source:
@@ -1879,10 +2052,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._times["toco"].clear()
         if "toco" in self._values:
             self._values["toco"].clear()
-        self._times["spo2"].clear()
-        self._values["spo2"].clear()
+        self._times["fspo2"].clear()
+        self._values["fspo2"].clear()
         # Spectrogram data is stored in a ring buffer.
         self._last_packet_ts = None
+        self._clear_summary_values()
         if hasattr(self, "_spec_last_sample_end"):
             for sig in self._spec_last_sample_end:
                 self._spec_last_sample_end[sig] = 0
@@ -1891,8 +2065,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._clear_buffers()
         for sig, line in self._lines.items():
             line.set_data([], [])
-        if hasattr(self, "_spo2_line"):
-            self._spo2_line.set_data([], [])
+        if hasattr(self, "_fspo2_line"):
+            self._fspo2_line.set_data([], [])
         if hasattr(self, "_toco_line"):
             self._toco_line.set_data([], [])
         if hasattr(self, "_toco_fill") and self._toco_fill in self._toco_plot.ax.collections:
@@ -2002,7 +2176,7 @@ class MainWindow(QtWidgets.QMainWindow):
         active = set(self._active_signals())
         for sig, line in self._lines.items():
             line.set_visible(sig in active)
-        self._spo2_line.set_visible(self._spo2_toggle.isChecked())
+        self._fspo2_line.set_visible(self._spo2_toggle.isChecked())
         self._spo2_ax.set_visible(self._spo2_toggle.isChecked())
         self._settings.setValue("show_hr1", self._hr1_toggle.isChecked())
         self._settings.setValue("show_hr2", self._hr2_toggle.isChecked())
@@ -2027,12 +2201,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     base_time = self._times["toco"][0]
                 if latest_time is None or self._times["toco"][-1] > latest_time:
                     latest_time = self._times["toco"][-1]
-        if self._times.get("spo2"):
-            if self._times["spo2"]:
-                if base_time is None or self._times["spo2"][0] < base_time:
-                    base_time = self._times["spo2"][0]
-                if latest_time is None or self._times["spo2"][-1] > latest_time:
-                    latest_time = self._times["spo2"][-1]
+        if self._times.get("fspo2"):
+            if self._times["fspo2"]:
+                if base_time is None or self._times["fspo2"][0] < base_time:
+                    base_time = self._times["fspo2"][0]
+                if latest_time is None or self._times["fspo2"][-1] > latest_time:
+                    latest_time = self._times["fspo2"][-1]
         if base_time is None or latest_time is None:
             self._time_plot.canvas.draw_idle()
             return
@@ -2044,11 +2218,13 @@ class MainWindow(QtWidgets.QMainWindow):
             y = np.array(self._values[sig])
             count = min(len(x), len(y))
             self._lines[sig].set_data(x[:count], y[:count])
-        if self._times["spo2"]:
-            x_spo2 = mdates.date2num([datetime.fromtimestamp(t) for t in self._times["spo2"]])
-            y_spo2 = np.array(self._values["spo2"])
-            count = min(len(x_spo2), len(y_spo2))
-            self._spo2_line.set_data(x_spo2[:count], y_spo2[:count])
+        if self._times["fspo2"]:
+            x_fspo2 = mdates.date2num([datetime.fromtimestamp(t) for t in self._times["fspo2"]])
+            y_fspo2 = np.array(self._values["fspo2"])
+            count = min(len(x_fspo2), len(y_fspo2))
+            self._fspo2_line.set_data(x_fspo2[:count], y_fspo2[:count])
+        else:
+            self._fspo2_line.set_data([], [])
         if self._times["toco"]:
             x_toco = mdates.date2num([datetime.fromtimestamp(t) for t in self._times["toco"]])
             y_toco = np.array(self._values["toco"])
@@ -2081,7 +2257,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if len(all_vals):
             self._time_plot.ax.set_ylim(max(0, all_vals.min() - 5), all_vals.max() + 5)
 
-        if self._times["spo2"]:
+        if self._times["fspo2"]:
             self._spo2_ax.set_xlim(x_min, x_max)
             self._spo2_ax.set_ylim(70, 100)
         if self._times["toco"]:
