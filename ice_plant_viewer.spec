@@ -20,12 +20,19 @@ else:
     ICON_BASENAME = None
 
 hiddenimports = []
+hiddenimports += collect_submodules("paramiko")
 hiddenimports += collect_submodules("PySide6")
 hiddenimports += collect_submodules("matplotlib")
 hiddenimports += collect_submodules("numpy")
 
 datas = []
 datas += collect_data_files("matplotlib", include_py_files=True)
+if os.path.exists(WINDOWS_ICON_PATH):
+    datas.append((WINDOWS_ICON_PATH, "assets"))
+if os.path.exists(APPLE_ICON_PATH):
+    datas.append((APPLE_ICON_PATH, "assets"))
+elif os.path.exists(DEFAULT_ICON_PATH):
+    datas.append((DEFAULT_ICON_PATH, "assets"))
 
 a = Analysis(
     ["ice_plant_viewer.py"],
