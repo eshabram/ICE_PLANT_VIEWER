@@ -5,7 +5,7 @@ import sys
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 PROJECT_DIR = os.path.abspath(os.getcwd())
-APPLE_ICON_PATH = os.path.join(PROJECT_DIR, "assets", "ice-plant-apple.icns")
+APPLE_ICON_PATH = os.path.join(PROJECT_DIR, "assets", "ice-plant-apple.icon", "ice-plant-apple.icns")
 DEFAULT_ICON_PATH = os.path.join(PROJECT_DIR, "assets", "ice_plant.icns")
 WINDOWS_ICON_PATH = os.path.join(PROJECT_DIR, "assets", "ice_plant.ico")
 
