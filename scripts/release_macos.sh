@@ -11,6 +11,11 @@ SET_VERSION=""
 
 cd "$ROOT_DIR"
 
+if ! command -v create-dmg >/dev/null 2>&1; then
+  echo "create-dmg is required for macOS releases. Install it before running this script." >&2
+  exit 1
+fi
+
 usage() {
   cat <<EOF
 Usage: scripts/release_macos.sh [--no-bump] [--version X.Y.Z]

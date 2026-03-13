@@ -4,7 +4,17 @@ import glob
 import platform
 import re
 import math
+import socket
 from typing import Callable
+from dataclasses import dataclass
+
+if os.name == "nt":
+    import ctypes
+
+try:
+    import paramiko  # type: ignore
+except Exception:
+    paramiko = None
 
 try:
     import serial  # type: ignore
@@ -54,6 +64,69 @@ ANSI_ESC_RE = re.compile(r"\x1b[@-_]")
 WINDOWS_SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
+@dataclass
+class RemoteAuth:
+    mode: str = "key"
+    password: Optional[str] = None
+
+
+class RemoteAuthError(RuntimeError):
+    pass
+
+
+class SubprocessTailProcess:
+    def __init__(self, proc: subprocess.Popen) -> None:
+        self._proc = proc
+
+    def readline(self, timeout: float = 1.0) -> str:
+        if self._proc.stdout is None:
+            return ""
+        rlist, _, _ = select.select([self._proc.stdout], [], [], timeout)
+        if not rlist:
+            return ""
+        return self._proc.stdout.readline()
+
+    def poll(self) -> Optional[int]:
+        return self._proc.poll()
+
+    def terminate(self) -> None:
+        if self._proc.poll() is None:
+            self._proc.terminate()
+
+
+class ParamikoTailProcess:
+    def __init__(self, client, channel) -> None:
+        self._client = client
+        self._channel = channel
+        self._stdout = channel.makefile("r", -1)
+
+    def readline(self, timeout: float = 1.0) -> str:
+        self._channel.settimeout(timeout)
+        try:
+            return self._stdout.readline()
+        except socket.timeout:
+            return ""
+
+    def poll(self) -> Optional[int]:
+        if self._channel.exit_status_ready():
+            return self._channel.recv_exit_status()
+        return None
+
+    def terminate(self) -> None:
+        try:
+            self._stdout.close()
+        except Exception:
+            pass
+        try:
+            self._channel.close()
+        except Exception:
+            pass
+        try:
+            self._client.close()
+        except Exception:
+            pass
+
+
 def run_subprocess(*args, **kwargs):
     kwargs.setdefault("creationflags", WINDOWS_SUBPROCESS_FLAGS)
     return subprocess.run(*args, **kwargs)
@@ -62,6 +135,47 @@ def run_subprocess(*args, **kwargs):
 def popen_subprocess(*args, **kwargs):
     kwargs.setdefault("creationflags", WINDOWS_SUBPROCESS_FLAGS)
     return subprocess.Popen(*args, **kwargs)
+
+
+def resource_path(*parts: str) -> str:
+    base_dir = getattr(sys, "_MEIPASS", os.path.abspath(os.path.dirname(__file__)))
+    return os.path.join(base_dir, *parts)
+
+
+def application_icon_path() -> Optional[str]:
+    if sys.platform.startswith("win"):
+        candidates = [
+            resource_path("assets", "ice_plant.ico"),
+            os.path.join(os.path.abspath(os.path.dirname(sys.executable)), "assets", "ice_plant.ico"),
+            sys.executable if getattr(sys, "frozen", False) else "",
+        ]
+    elif sys.platform == "darwin":
+        candidates = [
+            resource_path("assets", "ice-plant-apple.icns"),
+            resource_path("assets", "ice_plant.icns"),
+        ]
+    else:
+        candidates = []
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def apply_runtime_app_identity(app_name: str, app: QtWidgets.QApplication) -> Optional[QtGui.QIcon]:
+    if os.name == "nt":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ICE_PLANT.IcePlantViewer")
+        except Exception:
+            pass
+    icon_path = application_icon_path()
+    if not icon_path:
+        return None
+    icon = QtGui.QIcon(icon_path)
+    if icon.isNull():
+        return None
+    app.setWindowIcon(icon)
+    return icon
 
 
 def decode_hr_sample(hi: int, lo: int) -> Optional[float]:
@@ -245,8 +359,8 @@ def control_character_for_key(key: int) -> Optional[str]:
     return None
 
 
-def ssh_cmd(host: str, remote_cmd: str) -> List[str]:
-    return [
+def ssh_cmd(host: str, remote_cmd: str, batch_mode: bool = True) -> List[str]:
+    cmd = [
         "ssh",
         "-o",
         "ConnectTimeout=5",
@@ -261,24 +375,115 @@ def ssh_cmd(host: str, remote_cmd: str) -> List[str]:
         host,
         remote_cmd,
     ]
+    if batch_mode:
+        cmd[1:1] = ["-o", "BatchMode=yes"]
+    return cmd
 
 
-def get_latest_remote_file(host: str, remote_dir: str) -> Optional[str]:
+def parse_ssh_target(host: str) -> Tuple[str, str]:
+    if "@" in host:
+        user, hostname = host.rsplit("@", 1)
+        return user, hostname
+    return os.environ.get("USER") or os.environ.get("USERNAME") or "pi", host
+
+
+def is_ssh_auth_error(message: str) -> bool:
+    lower = message.lower()
+    return (
+        "permission denied" in lower
+        or "publickey" in lower
+        or "keyboard-interactive" in lower
+        or "authentication failed" in lower
+    )
+
+
+def connect_paramiko_client(host: str, password: str, timeout: float = 5.0):
+    if paramiko is None:
+        raise RuntimeError("paramiko is not installed")
+    username, hostname = parse_ssh_target(host)
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(
+        hostname=hostname,
+        username=username,
+        password=password,
+        timeout=timeout,
+        auth_timeout=timeout,
+        banner_timeout=timeout,
+        look_for_keys=True,
+        allow_agent=True,
+    )
+    return client
+
+
+def run_remote_command(host: str, remote_cmd: str, auth: Optional[RemoteAuth] = None, timeout: float = 5.0) -> Tuple[int, str, str]:
+    auth = auth or RemoteAuth()
+    if auth.mode == "password":
+        client = connect_paramiko_client(host, auth.password or "", timeout=timeout)
+        try:
+            _stdin, stdout, stderr = client.exec_command(remote_cmd, timeout=timeout)
+            output = stdout.read().decode("utf-8", errors="replace")
+            error = stderr.read().decode("utf-8", errors="replace")
+            code = stdout.channel.recv_exit_status()
+            return code, output, error
+        finally:
+            client.close()
+
+    proc = run_subprocess(ssh_cmd(host, remote_cmd, batch_mode=True), capture_output=True, text=True, timeout=timeout)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def open_remote_tail(host: str, remote_cmd: str, auth: Optional[RemoteAuth] = None):
+    auth = auth or RemoteAuth()
+    if auth.mode == "password":
+        client = connect_paramiko_client(host, auth.password or "", timeout=5.0)
+        transport = client.get_transport()
+        if transport is None:
+            client.close()
+            raise RuntimeError("Failed to open SSH transport.")
+        channel = transport.open_session()
+        channel.exec_command(remote_cmd)
+        return ParamikoTailProcess(client, channel)
+
+    proc = popen_subprocess(ssh_cmd(host, remote_cmd, batch_mode=True), stdout=subprocess.PIPE, text=True)
+    return SubprocessTailProcess(proc)
+
+
+def validate_remote_auth(host: str, auth: Optional[RemoteAuth] = None) -> None:
+    code, stdout, stderr = run_remote_command(host, "printf __iceplant_auth_ok__", auth=auth, timeout=5.0)
+    if code == 0 and "__iceplant_auth_ok__" in stdout:
+        return
+    message = stderr.strip() or stdout.strip() or "SSH authentication failed."
+    if is_ssh_auth_error(message):
+        raise RemoteAuthError(message)
+    raise RuntimeError(message)
+
+
+def get_latest_remote_file(host: str, remote_dir: str, auth: Optional[RemoteAuth] = None) -> Optional[str]:
     cmd = (
         f"ls -t {shlex.quote(remote_dir)}/ctg_frames_*.csv "
         f"{shlex.quote(remote_dir)}/ctg_frames_sim_*.csv 2>/dev/null | head -n1"
     )
-    proc = run_subprocess(ssh_cmd(host, cmd), capture_output=True, text=True, timeout=5)
-    path = proc.stdout.strip()
+    code, stdout, stderr = run_remote_command(host, cmd, auth=auth, timeout=5.0)
+    if code != 0:
+        message = stderr.strip() or stdout.strip() or "Failed to list remote files."
+        if is_ssh_auth_error(message):
+            raise RemoteAuthError(message)
+        raise RuntimeError(message)
+    path = stdout.strip()
     return path if path else None
 
 
-def read_remote_file(host: str, path: str) -> List[str]:
+def read_remote_file(host: str, path: str, auth: Optional[RemoteAuth] = None) -> List[str]:
     cmd = f"cat {shlex.quote(path)}"
-    proc = run_subprocess(ssh_cmd(host, cmd), capture_output=True, text=True, timeout=10)
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or "Failed to read remote file.")
-    return proc.stdout.splitlines()
+    code, stdout, stderr = run_remote_command(host, cmd, auth=auth, timeout=10.0)
+    if code != 0:
+        message = stderr.strip() or stdout.strip() or "Failed to read remote file."
+        if is_ssh_auth_error(message):
+            raise RemoteAuthError(message)
+        raise RuntimeError(message)
+    return stdout.splitlines()
 
 
 class TailWorker(QtCore.QObject):
@@ -293,13 +498,15 @@ class TailWorker(QtCore.QObject):
         host: str,
         remote_dir: str,
         prefill_seconds: int = 0,
+        auth: Optional[RemoteAuth] = None,
         parent: Optional[QtCore.QObject] = None,
     ) -> None:
         super().__init__(parent)
         self._host = host
         self._remote_dir = remote_dir
         self._prefill_seconds = max(0, int(prefill_seconds))
-        self._proc: Optional[subprocess.Popen] = None
+        self._auth = auth or RemoteAuth()
+        self._proc = None
         self._stop_requested = False
         self._current_path: Optional[str] = None
         self._switch_requested = False
@@ -311,7 +518,7 @@ class TailWorker(QtCore.QObject):
         self._start_poll_thread()
         while not self._stop_requested:
             try:
-                remote_path = get_latest_remote_file(self._host, self._remote_dir)
+                remote_path = get_latest_remote_file(self._host, self._remote_dir, auth=self._auth)
             except Exception as exc:
                 self.status.emit(f"Remote: Disconnected: {exc}")
                 self.stopped.emit()
@@ -328,13 +535,15 @@ class TailWorker(QtCore.QObject):
                 self.status.emit(f"Remote: Tailing {remote_path}")
                 if self._prefill_seconds > 0:
                     try:
-                        last_line_proc = run_subprocess(
-                            ssh_cmd(self._host, f"tail -n 1 {shlex.quote(remote_path)}"),
-                            capture_output=True,
-                            text=True,
-                            timeout=5,
+                        last_code, last_stdout, last_stderr = run_remote_command(
+                            self._host,
+                            f"tail -n 1 {shlex.quote(remote_path)}",
+                            auth=self._auth,
+                            timeout=5.0,
                         )
-                        last_line = last_line_proc.stdout.strip()
+                        if last_code != 0:
+                            raise RuntimeError(last_stderr.strip() or "Failed to inspect the latest remote line.")
+                        last_line = last_stdout.strip()
                         last_parsed = parse_payload_line(last_line) if last_line else None
                         if last_parsed is not None:
                             latest_ts, _, _ = last_parsed
@@ -343,13 +552,15 @@ class TailWorker(QtCore.QObject):
                                 f"awk -F, 'NR>1 && $1+0>={cutoff:.6f} {{print}}' "
                                 f"{shlex.quote(remote_path)}"
                             )
-                            prefill_proc = run_subprocess(
-                                ssh_cmd(self._host, awk_cmd),
-                                capture_output=True,
-                                text=True,
-                                timeout=10,
+                            prefill_code, prefill_stdout, prefill_stderr = run_remote_command(
+                                self._host,
+                                awk_cmd,
+                                auth=self._auth,
+                                timeout=10.0,
                             )
-                            for line in prefill_proc.stdout.splitlines():
+                            if prefill_code != 0:
+                                raise RuntimeError(prefill_stderr.strip() or "Failed to prefill remote samples.")
+                            for line in prefill_stdout.splitlines():
                                 if self._stop_requested:
                                     break
                                 self.line_received.emit(line)
@@ -362,27 +573,15 @@ class TailWorker(QtCore.QObject):
 
             cmd = f"tail -F -n 0 {shlex.quote(remote_path)}"
             try:
-                self._proc = popen_subprocess(ssh_cmd(self._host, cmd), stdout=subprocess.PIPE, text=True)
+                self._proc = open_remote_tail(self._host, cmd, auth=self._auth)
             except Exception as exc:
                 self.status.emit(f"Remote: Disconnected: {exc}")
                 self.stopped.emit()
                 break
 
-            if self._proc.stdout is None:
-                self.status.emit("Remote: Failed to open SSH stream.")
-                self.stopped.emit()
-                break
-
             while not self._stop_requested:
-                if self._proc.stdout is None:
-                    break
-                rlist, _, _ = select.select([self._proc.stdout], [], [], 1.0)
-                if rlist:
-                    line = self._proc.stdout.readline()
-                    if not line:
-                        self.status.emit("Remote: Disconnected")
-                        self._stop_requested = True
-                        break
+                line = self._proc.readline(timeout=1.0) if self._proc is not None else ""
+                if line:
                     self.line_received.emit(line)
                 if self._switch_requested:
                     self._switch_requested = False
@@ -409,6 +608,7 @@ class TailWorker(QtCore.QObject):
                 self._proc.terminate()
             except Exception:
                 pass
+        self._proc = None
 
     def _start_poll_thread(self) -> None:
         if self._poll_thread and self._poll_thread.is_alive():
@@ -426,7 +626,7 @@ class TailWorker(QtCore.QObject):
     def _poll_loop(self) -> None:
         while not self._poll_stop.is_set():
             try:
-                latest = get_latest_remote_file(self._host, self._remote_dir)
+                latest = get_latest_remote_file(self._host, self._remote_dir, auth=self._auth)
             except Exception:
                 latest = None
             if latest and latest != self._current_path:
@@ -440,15 +640,22 @@ class StaticWorker(QtCore.QObject):
     stopped = QtCore.Signal()
     file_selected = QtCore.Signal(str)
 
-    def __init__(self, host: str, remote_dir: str, parent: Optional[QtCore.QObject] = None) -> None:
+    def __init__(
+        self,
+        host: str,
+        remote_dir: str,
+        auth: Optional[RemoteAuth] = None,
+        parent: Optional[QtCore.QObject] = None,
+    ) -> None:
         super().__init__(parent)
         self._host = host
         self._remote_dir = remote_dir
+        self._auth = auth or RemoteAuth()
 
     @QtCore.Slot()
     def run(self) -> None:
         try:
-            remote_path = get_latest_remote_file(self._host, self._remote_dir)
+            remote_path = get_latest_remote_file(self._host, self._remote_dir, auth=self._auth)
         except Exception as exc:
             self.status.emit(f"Remote: Error finding file: {exc}")
             self.stopped.emit()
@@ -462,7 +669,7 @@ class StaticWorker(QtCore.QObject):
         self.file_selected.emit(remote_path)
         self.status.emit(f"Remote: Loading {remote_path}")
         try:
-            lines = read_remote_file(self._host, remote_path)
+            lines = read_remote_file(self._host, remote_path, auth=self._auth)
         except Exception as exc:
             self.status.emit(f"Remote: Read failed: {exc}")
             self.stopped.emit()
@@ -477,11 +684,19 @@ class DownloadWorker(QtCore.QObject):
     error = QtCore.Signal(str)
     finished = QtCore.Signal()
 
-    def __init__(self, host: str, remote_dir: str, dest_dir: str, parent: Optional[QtCore.QObject] = None) -> None:
+    def __init__(
+        self,
+        host: str,
+        remote_dir: str,
+        dest_dir: str,
+        auth: Optional[RemoteAuth] = None,
+        parent: Optional[QtCore.QObject] = None,
+    ) -> None:
         super().__init__(parent)
         self._host = host
         self._remote_dir = remote_dir
         self._dest_dir = dest_dir
+        self._auth = auth or RemoteAuth()
 
     @QtCore.Slot()
     def run(self) -> None:
@@ -489,8 +704,13 @@ class DownloadWorker(QtCore.QObject):
             f"ls -1 {shlex.quote(self._remote_dir)}/ctg_frames_*.csv 2>/dev/null | "
             f"grep -v '_sim_'"
         )
-        proc = run_subprocess(ssh_cmd(self._host, list_cmd), capture_output=True, text=True)
-        if proc.returncode != 0 or not proc.stdout.strip():
+        code, stdout, stderr = run_remote_command(self._host, list_cmd, auth=self._auth, timeout=10.0)
+        if code != 0:
+            self.status.emit("Remote: Download failed. See details.")
+            self.error.emit(stderr.strip() or stdout.strip() or "SSH file listing failed.")
+            self.finished.emit()
+            return
+        if not stdout.strip():
             self.status.emit("Remote: No CSV files found.")
             self.finished.emit()
             return
@@ -500,35 +720,71 @@ class DownloadWorker(QtCore.QObject):
             f"cd {shlex.quote(self._remote_dir)} && "
             f"tar -czf - --exclude='*sim*' ctg_frames_*.csv"
         )
-        ssh_proc = popen_subprocess(
-            ssh_cmd(self._host, tar_cmd),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        if ssh_proc.stdout is None:
-            self.status.emit("Remote: Failed to start SSH download.")
-            self.finished.emit()
-            return
+        ssh_err = ""
+        ssh_proc = None
+        if self._auth.mode == "password":
+            try:
+                tar_proc = popen_subprocess(
+                    ["tar", "-xzf", "-", "-C", self._dest_dir],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                client = connect_paramiko_client(self._host, self._auth.password or "", timeout=10.0)
+                _stdin, stdout_stream, stderr_stream = client.exec_command(tar_cmd, timeout=10.0)
+                while True:
+                    chunk = stdout_stream.channel.recv(32768)
+                    if not chunk:
+                        break
+                    if tar_proc.stdin is not None:
+                        tar_proc.stdin.write(chunk)
+                if tar_proc.stdin is not None:
+                    tar_proc.stdin.close()
+                ssh_err = stderr_stream.read().decode("utf-8", errors="replace")
+                ssh_code = stdout_stream.channel.recv_exit_status()
+                client.close()
+            except Exception as exc:
+                if tar_proc.stdin is not None and not tar_proc.stdin.closed:
+                    tar_proc.stdin.close()
+                tar_proc.kill()
+                self.status.emit("Remote: Download failed. See details.")
+                self.error.emit(str(exc))
+                self.finished.emit()
+                return
+        else:
+            ssh_proc = popen_subprocess(
+                ssh_cmd(self._host, tar_cmd),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if ssh_proc.stdout is None:
+                self.status.emit("Remote: Failed to start SSH download.")
+                self.finished.emit()
+                return
+            tar_proc = popen_subprocess(
+                ["tar", "-xzf", "-", "-C", self._dest_dir],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if tar_proc.stdin is not None:
+                while True:
+                    chunk = ssh_proc.stdout.read(32768)
+                    if not chunk:
+                        break
+                    tar_proc.stdin.write(chunk.encode() if isinstance(chunk, str) else chunk)
+                tar_proc.stdin.close()
+            ssh_err = ssh_proc.stderr.read().decode("utf-8", errors="replace") if ssh_proc.stderr else ""
+            ssh_proc.wait()
+            ssh_code = ssh_proc.returncode
 
-        tar_proc = popen_subprocess(
-            ["tar", "-xzf", "-", "-C", self._dest_dir],
-            stdin=ssh_proc.stdout,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        ssh_proc.stdout.close()
-
-        ssh_err = ssh_proc.stderr.read().decode("utf-8", errors="replace") if ssh_proc.stderr else ""
         _, tar_err = tar_proc.communicate()
-        ssh_proc.wait()
-
-        if ssh_proc.returncode != 0:
+        if ssh_code != 0:
             msg = ssh_err.strip() or "SSH download failed."
             self.status.emit("Remote: Download failed. See details.")
             self.error.emit(msg)
             self.finished.emit()
             return
-
         if tar_proc.returncode != 0:
             msg = (tar_err.decode("utf-8", errors="replace") if tar_err else "").strip()
             self.status.emit("Remote: Download failed. See details.")
@@ -1080,15 +1336,22 @@ class SerialTerminalDialog(QtWidgets.QDialog):
 class FileCheckWorker(QtCore.QObject):
     result = QtCore.Signal(object)
 
-    def __init__(self, host: str, remote_dir: str, parent: Optional[QtCore.QObject] = None) -> None:
+    def __init__(
+        self,
+        host: str,
+        remote_dir: str,
+        auth: Optional[RemoteAuth] = None,
+        parent: Optional[QtCore.QObject] = None,
+    ) -> None:
         super().__init__(parent)
         self._host = host
         self._remote_dir = remote_dir
+        self._auth = auth or RemoteAuth()
 
     @QtCore.Slot()
     def run(self) -> None:
         try:
-            latest = get_latest_remote_file(self._host, self._remote_dir)
+            latest = get_latest_remote_file(self._host, self._remote_dir, auth=self._auth)
         except Exception:
             latest = None
         self.result.emit(latest)
@@ -1361,6 +1624,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._serial_dialogs: List[QtWidgets.QDialog] = []
         self._last_packet_ts: Optional[float] = None
         self._data_source: Optional[str] = None
+        self._remote_auth_cache: Dict[str, RemoteAuth] = {}
 
         self._signal_map = {
             "hr1": decode_hr1_samples,
@@ -1440,6 +1704,59 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._connect()
 
+    def _prompt_remote_password(self, host: str) -> Optional[str]:
+        username, hostname = parse_ssh_target(host)
+        password, ok = QtWidgets.QInputDialog.getText(
+            self,
+            "Remote SSH Password",
+            f"Password for {username}@{hostname}:",
+            QtWidgets.QLineEdit.Password,
+        )
+        if not ok:
+            return None
+        return password
+
+    def _resolve_remote_auth(self, host: str) -> Optional[RemoteAuth]:
+        cached = self._remote_auth_cache.get(host)
+        if cached is not None:
+            try:
+                validate_remote_auth(host, cached)
+                return cached
+            except Exception:
+                self._remote_auth_cache.pop(host, None)
+
+        key_auth = RemoteAuth(mode="key")
+        try:
+            validate_remote_auth(host, key_auth)
+            self._remote_auth_cache[host] = key_auth
+            return key_auth
+        except RemoteAuthError:
+            if paramiko is None:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Remote SSH",
+                    "SSH key authentication failed and password fallback is unavailable because paramiko is not installed.",
+                )
+                return None
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Remote SSH", str(exc))
+            return None
+
+        while True:
+            password = self._prompt_remote_password(host)
+            if password is None:
+                return None
+            password_auth = RemoteAuth(mode="password", password=password)
+            try:
+                validate_remote_auth(host, password_auth)
+                self._remote_auth_cache[host] = password_auth
+                return password_auth
+            except RemoteAuthError:
+                QtWidgets.QMessageBox.warning(self, "Remote SSH", "Password authentication failed.")
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self, "Remote SSH", str(exc))
+                return None
+
     def _connect(self) -> None:
         host = self._host_input.text().strip() or DEFAULT_HOST
         self._settings.setValue("recent_host", host)
@@ -1477,8 +1794,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self._stop_serial_stream()
             self._reset_live_buffers()
 
+        auth = self._resolve_remote_auth(host)
+        if auth is None:
+            self._connect_button.setEnabled(True)
+            self._connect_button.setText("Connect")
+            self._load_button.setEnabled(True)
+            self._on_status("Disconnected")
+            return
+
         prefill_seconds = WINDOW_SECONDS
-        self._worker = TailWorker(host, DEFAULT_REMOTE_DIR, prefill_seconds=prefill_seconds)
+        self._worker = TailWorker(host, DEFAULT_REMOTE_DIR, prefill_seconds=prefill_seconds, auth=auth)
         self._thread = QtCore.QThread()
         self._worker.moveToThread(self._thread)
 
@@ -1539,13 +1864,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
         host = self._host_input.text().strip() or DEFAULT_HOST
         self._settings.setValue("recent_host", host)
+        auth = self._resolve_remote_auth(host)
+        if auth is None:
+            self._load_button.setEnabled(True)
+            self._connect_button.setEnabled(True)
+            self._on_status("Disconnected")
+            return
         self._status_label.setText("Loading latest file...")
         self._load_button.setEnabled(False)
         self._connect_button.setEnabled(False)
         self._static_view = True
         self._data_source = "static"
 
-        self._static_worker = StaticWorker(host, DEFAULT_REMOTE_DIR)
+        self._static_worker = StaticWorker(host, DEFAULT_REMOTE_DIR, auth=auth)
         self._static_thread = QtCore.QThread()
         self._static_worker.moveToThread(self._static_thread)
 
@@ -1908,9 +2239,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         host = self._host_input.text().strip() or DEFAULT_HOST
         self._settings.setValue("recent_host", host)
+        auth = self._resolve_remote_auth(host)
+        if auth is None:
+            self._on_status("Disconnected")
+            return
 
         self._status_label.setText("Preparing download...")
-        self._download_worker = DownloadWorker(host, DEFAULT_REMOTE_DIR, dest)
+        self._download_worker = DownloadWorker(host, DEFAULT_REMOTE_DIR, dest, auth=auth)
         self._download_thread = QtCore.QThread()
         self._download_worker.moveToThread(self._download_thread)
 
@@ -2504,7 +2839,10 @@ def main() -> None:
     app = QtWidgets.QApplication(sys.argv)
     if hasattr(app, "setApplicationDisplayName"):
         app.setApplicationDisplayName(app_name)
+    app_icon = apply_runtime_app_identity(app_name, app)
     window = MainWindow()
+    if app_icon is not None:
+        window.setWindowIcon(app_icon)
     window.resize(1100, 700)
     window.show()
     QtCore.QTimer.singleShot(0, window._apply_theme)
