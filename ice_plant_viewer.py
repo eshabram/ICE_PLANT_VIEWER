@@ -3,6 +3,7 @@ import sys
 import glob
 import platform
 import re
+import math
 from typing import Callable
 
 try:
@@ -144,6 +145,8 @@ def parse_payload_line(line: str) -> Optional[Tuple[float, str, List[int]]]:
         ts = float(row[0])
     except ValueError:
         return None
+    if not math.isfinite(ts):
+        return None
     if len(row) >= 4 and row[1] in VALID_BLOCK_TYPES:
         block_type = row[1]
         try:
@@ -168,6 +171,22 @@ def parse_payload_line(line: str) -> Optional[Tuple[float, str, List[int]]]:
     if lead not in (0x43, 0x49, 0x50, 0x54, 0x53, 0x46, 0x4E):
         return None
     return ts, chr(lead), values[1:]
+
+
+def series_to_plot_data(times: Deque[float], values: Deque[float]) -> Tuple[np.ndarray, np.ndarray]:
+    x_values: List[float] = []
+    y_values: List[float] = []
+    time_values = list(times)
+    signal_values = list(values)
+    for t, v in zip(time_values, signal_values):
+        if not (math.isfinite(t) and math.isfinite(v)):
+            continue
+        try:
+            x_values.append(mdates.date2num(datetime.fromtimestamp(t)))
+        except (OverflowError, OSError, ValueError):
+            continue
+        y_values.append(v)
+    return np.asarray(x_values), np.asarray(y_values)
 
 
 def sanitize_terminal_text(text: str) -> str:
@@ -1373,6 +1392,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._spo2_ax = self._time_plot.ax.twinx()
         self._spo2_ax.set_ylabel("FSpO2")
+        self._spo2_ax.set_ylim(70, 100)
+        self._spo2_ax.set_autoscaley_on(False)
         self._fspo2_line = self._spo2_ax.plot([], [], lw=1, color="tab:red", label="FSpO2")[0]
         self._time_plot.ax.legend(loc="upper left")
         self._spo2_ax.legend(loc="upper right")
@@ -2214,20 +2235,17 @@ class MainWindow(QtWidgets.QMainWindow):
         for sig in active:
             if not self._times[sig]:
                 continue
-            x = mdates.date2num([datetime.fromtimestamp(t) for t in self._times[sig]])
-            y = np.array(self._values[sig])
+            x, y = series_to_plot_data(self._times[sig], self._values[sig])
             count = min(len(x), len(y))
             self._lines[sig].set_data(x[:count], y[:count])
         if self._times["fspo2"]:
-            x_fspo2 = mdates.date2num([datetime.fromtimestamp(t) for t in self._times["fspo2"]])
-            y_fspo2 = np.array(self._values["fspo2"])
+            x_fspo2, y_fspo2 = series_to_plot_data(self._times["fspo2"], self._values["fspo2"])
             count = min(len(x_fspo2), len(y_fspo2))
             self._fspo2_line.set_data(x_fspo2[:count], y_fspo2[:count])
         else:
             self._fspo2_line.set_data([], [])
         if self._times["toco"]:
-            x_toco = mdates.date2num([datetime.fromtimestamp(t) for t in self._times["toco"]])
-            y_toco = np.array(self._values["toco"])
+            x_toco, y_toco = series_to_plot_data(self._times["toco"], self._values["toco"])
             count = min(len(x_toco), len(y_toco))
             if count > 0:
                 x_slice = x_toco[:count]
@@ -2257,9 +2275,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if len(all_vals):
             self._time_plot.ax.set_ylim(max(0, all_vals.min() - 5), all_vals.max() + 5)
 
+        self._spo2_ax.set_ylim(70, 100)
         if self._times["fspo2"]:
             self._spo2_ax.set_xlim(x_min, x_max)
-            self._spo2_ax.set_ylim(70, 100)
         if self._times["toco"]:
             self._toco_plot.ax.set_xlim(x_min, x_max)
             finite = y_toco[np.isfinite(y_toco)] if self._times["toco"] else np.array([])
