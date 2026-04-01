@@ -110,3 +110,6 @@ Example:
 git tag v0.2.0
 git push origin v0.2.0
 ```
+
+## Development Note
+AI was used to generate templates, suggest bug fixes, and generally harden the security, safety, and syntax of the code. All AI-generated code was reviewed and tweaked by the author. 
