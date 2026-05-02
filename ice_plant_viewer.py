@@ -62,8 +62,6 @@ ANSI_SS3_RE = re.compile(r"\x1bO.")
 ANSI_ESC_RE = re.compile(r"\x1b[@-_]")
 
 WINDOWS_SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-
-
 @dataclass
 class RemoteAuth:
     mode: str = "key"
@@ -313,8 +311,6 @@ def series_to_plot_data(times: Deque[float], values: Deque[float]) -> Tuple[np.n
             continue
         y_values.append(v)
     return np.asarray(x_values), np.asarray(y_values)
-
-
 def sanitize_terminal_text(text: str) -> str:
     if not text:
         return ""
@@ -1808,7 +1804,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker.moveToThread(self._thread)
 
         self._thread.started.connect(self._worker.run)
-        self._worker.line_received.connect(lambda line: self._on_line_with_source(line, "remote"))
+        self._worker.line_received.connect(self._on_remote_line)
         self._worker.prefill_done.connect(self._on_prefill_done)
         self._worker.status.connect(self._on_status)
         self._worker.file_selected.connect(self._on_file_selected)
@@ -2050,7 +2046,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._serial_thread = QtCore.QThread()
         self._serial_worker.moveToThread(self._serial_thread)
         self._serial_thread.started.connect(self._serial_worker.run)
-        self._serial_worker.line_received.connect(lambda line: self._on_line_with_source(line, "serial"))
+        self._serial_worker.line_received.connect(self._on_serial_line)
         self._serial_worker.status.connect(self._on_status)
         self._serial_worker.file_selected.connect(self._on_file_selected)
         self._serial_worker.stopped.connect(self._on_serial_stopped)
@@ -2351,6 +2347,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._status_label.setText("Loaded latest file")
         self._connect_button.setEnabled(True)
         self._connect_button.setText("Go Live")
+
+    @QtCore.Slot(str)
+    def _on_remote_line(self, line: str) -> None:
+        self._on_line_with_source(line, "remote")
+
+    @QtCore.Slot(str)
+    def _on_serial_line(self, line: str) -> None:
+        self._on_line_with_source(line, "serial")
 
     def _on_line(self, line: str) -> None:
         parsed = parse_payload_line(line)
